@@ -3,6 +3,9 @@ const path = require("path");
 const fs = require("fs").promises;
 const { execSync } = require("child_process");
 
+const packageJson = require(path.join(__dirname, "..", "package.json"));
+const TARGET_REPO = packageJson.config.targetRepo;
+
 // Detect if running through npx by checking if we're in a temporary npm directory
 function isRunningThroughNPX() {
   return (
