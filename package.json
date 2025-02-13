@@ -3,7 +3,7 @@
   "version": "0.0.3",
   "description": "Apply patches from hyperfy user branches",
   "bin": {
-    "hucow": "./bin/cli.js"
+    "hucow": "./bin/wrapper.js"
   },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
@@ -12,7 +12,8 @@
   "license": "GPL-3.0-only",
   "dependencies": {
     "commander": "^11.0.0",
-    "execa": "^5.1.1"
+    "execa": "^5.1.1",
+    "find-up": "^7.0.0"
   },
   "config": {
     "patchesRepo": "https://github.com/drama-haus/hyperfy.git",

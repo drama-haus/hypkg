@@ -229,38 +229,12 @@ async function listPatches() {
   }
 }
 
-async function createLocalBinLink() {
+async function ensureGlobalLink() {
   try {
-    // Create node_modules/.bin if it doesn't exist
-    const binDir = path.join(process.cwd(), "node_modules", ".bin");
-    await fs.mkdir(binDir, { recursive: true });
-
-    // Get the absolute path to our CLI script
-    const cliPath = path.join(
-      process.cwd(),
-      "node_modules",
-      PACKAGE_NAME,
-      "bin",
-      "cli.js"
-    );
-    const localBinPath = path.join(binDir, PACKAGE_NAME);
-
-    // Create symlink
-    try {
-      await fs.symlink(cliPath, localBinPath);
-      console.log(`Created local binary link: ${PACKAGE_NAME}`);
-    } catch (e) {
-      if (e.code === "EEXIST") {
-        console.log("Local binary link already exists");
-      } else {
-        throw e;
-      }
-    }
-
-    // Make the CLI file executable
-    await fs.chmod(cliPath, "755");
+      await execa('npm', ['link'], { cwd: path.join(__dirname, '..') });
+      console.log('Global command link created successfully');
   } catch (e) {
-    throw new Error(`Failed to create local binary link: ${e.message}`);
+      throw new Error(`Failed to create global command link: ${e.message}`);
   }
 }
 
@@ -279,7 +253,7 @@ program
       await ensurePatchBranch(baseBranch);
 
       await execa('npm', ['install']);
-      createLocalBinLink();
+      ensureGlobalLink();
       console.log("Patch management system installed successfully!");
       await listPatches();
     } catch (e) {
