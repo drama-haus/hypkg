@@ -548,7 +548,7 @@ async function publishPatch(branchName) {
   // Get the base branch commit
   const baseBranch = await getBaseBranch();
   const baseCommit = await execGit(
-    ["merge-base", baseBranch, branchName],
+    ["merge-base", `${BRANCH_NAME}-base`, branchName],
     "Failed to find merge base"
   );
 
