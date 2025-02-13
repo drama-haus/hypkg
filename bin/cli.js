@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const { program } = require("commander");
-const execa = require("execa"); // Changed this line
+const execa = require("execa");
 const path = require("path");
 const fs = require("fs").promises;
 
@@ -12,51 +12,32 @@ const TARGET_REPO = packageJson.config.targetRepo;
 const PACKAGE_NAME = packageJson.name;
 const BRANCH_NAME = PACKAGE_NAME;
 
+// Git utilities
+async function execGit(args, errorMessage) {
+  try {
+    const result = await execa("git", args);
+    return result.stdout.trim();
+  } catch (e) {
+    throw new Error(`${errorMessage}: ${e.message}`);
+  }
+}
+
 async function getCurrentBranch() {
-  const { stdout } = await execa("git", ["branch", "--show-current"]);
-  return stdout.trim();
+  return execGit(["branch", "--show-current"], "Failed to get current branch");
 }
 
-async function verifyRepo() {
-  try {
-    const { stdout } = await execa("git", ["remote", "get-url", "origin"]);
-    if (!stdout.trim().includes(TARGET_REPO.replace(".git", ""))) {
-      throw new Error(
-        `Not in the correct repository. Expected origin to be ${TARGET_REPO}`
-      );
-    }
-  } catch (e) {
-    throw new Error(`Repository verification failed: ${e.message}`);
-  }
+async function getBaseBranch() {
+  const branches = await execGit(["branch", "-a"], "Failed to get branches");
+  const hasDev = branches.includes("dev");
+  return hasDev ? "dev" : "main";
 }
 
-async function syncBranches() {
-  try {
-    await execa("git", ["fetch", "origin"]);
-
-    // Check if both branches exist
-    const { stdout: branches } = await execa("git", ["branch", "-a"]);
-    const hasDev = branches.includes("dev");
-
-    const targetBranch = hasDev ? "dev" : "main";
-    console.log(`Using ${targetBranch} as base branch`);
-
-    await execa("git", ["checkout", targetBranch]);
-    await execa("git", ["pull", "origin", targetBranch]);
-
-    return targetBranch;
-  } catch (e) {
-    throw new Error(`Failed to sync branches: ${e.message}`);
-  }
-}
-
+// Config management
 async function getPatchConfig() {
   const configPath = path.join(process.cwd(), "." + PACKAGE_NAME);
   try {
-    const config = JSON.parse(await fs.readFile(configPath, "utf8"));
-    return config;
+    return JSON.parse(await fs.readFile(configPath, "utf8"));
   } catch (e) {
-    // Return default config if file doesn't exist
     return {
       branch: BRANCH_NAME,
       appliedPatches: [],
@@ -69,166 +50,175 @@ async function savePatchConfig(config) {
   await fs.writeFile(configPath, JSON.stringify(config, null, 2));
 }
 
-async function ensurePatchBranch(baseBranch) {
-  try {
-    const { stdout } = await execa("git", ["remote"]);
-    if (!stdout.includes(PATCHES_REMOTE)) {
-      await execa("git", ["remote", "add", PATCHES_REMOTE, PATCHES_REPO]);
-    } else {
-      console.log("remote already");
-    }
-    await execa("git", ["fetch", PATCHES_REMOTE]);
+// Repository management
+async function verifyRepo() {
+  const origin = await execGit(
+    ["remote", "get-url", "origin"],
+    "Failed to get origin URL"
+  );
+  if (!origin.includes(TARGET_REPO.replace(".git", ""))) {
+    throw new Error(
+      `Not in the correct repository. Expected origin to be ${TARGET_REPO}`
+    );
+  }
+}
 
-    // Check if patch branch exists
-    const { stdout: branches } = await execa("git", ["branch"]);
-    console.log(branches.split("\n").map((b) => b.trim()));
-    if (
-      !branches
-        .split("\n")
-        .map((b) => b.trim())
-        .includes(BRANCH_NAME)
-    ) {
-      // Create new branch
-      await execa("git", [
+async function setupPatchesRemote() {
+  const remotes = await execGit(["remote"], "Failed to list remotes");
+  if (!remotes.includes(PATCHES_REMOTE)) {
+    await execGit(
+      ["remote", "add", PATCHES_REMOTE, PATCHES_REPO],
+      "Failed to add patches remote"
+    );
+  }
+  await execGit(["fetch", PATCHES_REMOTE], "Failed to fetch patches remote");
+}
+
+// Branch management
+async function syncBranches() {
+  await execGit(["fetch", "origin"], "Failed to fetch origin");
+  const baseBranch = await getBaseBranch();
+  console.log(`Using ${baseBranch} as base branch`);
+  await execGit(["checkout", baseBranch], "Failed to checkout base branch");
+  await execGit(["pull", "origin", baseBranch], "Failed to pull base branch");
+  return baseBranch;
+}
+
+async function ensurePatchBranch() {
+  await setupPatchesRemote();
+  const branches = await execGit(["branch"], "Failed to list branches");
+  const branchExists = branches
+    .split("\n")
+    .map((b) => b.trim())
+    .includes(BRANCH_NAME);
+
+  if (!branchExists) {
+    await execGit(
+      [
         "branch",
         "--track",
         PACKAGE_NAME,
         `${PATCHES_REMOTE}/${PACKAGE_NAME}-base`,
-      ]);
-      await execa("git", ["checkout", BRANCH_NAME]);
-    } else {
-      await execa("git", ["checkout", BRANCH_NAME]);
-      await execa("git", [
-        "branch",
-        `--set-upstream-to=${PATCHES_REMOTE}/${PACKAGE_NAME}-base`,
-      ]);
-    }
-
-    await execa("git", ["branch", PACKAGE_NAME, "--unset-upstream"]);
-
-    const config = await getPatchConfig();
-    await savePatchConfig(config);
-  } catch (e) {
-    throw new Error(`Failed to setup patch branch: ${e.message}`);
+      ],
+      "Failed to create patch branch"
+    );
   }
+
+  await execGit(["checkout", BRANCH_NAME], "Failed to checkout patch branch");
+  await execGit(
+    ["branch", `--set-upstream-to=${PATCHES_REMOTE}/${PACKAGE_NAME}-base`],
+    "Failed to set upstream"
+  );
+  await execGit(
+    ["branch", PACKAGE_NAME, "--unset-upstream"],
+    "Failed to unset upstream"
+  );
+
+  const config = await getPatchConfig();
+  await savePatchConfig(config);
 }
 
+// Patch operations
 async function applyPatch(patchName) {
-  try {
-    const config = await getPatchConfig();
+  const config = await getPatchConfig();
 
-    if (config.appliedPatches.includes(patchName)) {
-      console.log(`Patch ${patchName} is already applied`);
-      return;
-    }
-
-    const { stdout } = await execa("git", [
-      "rev-list",
-      "-n",
-      "1",
-      `${PATCHES_REMOTE}/${patchName}`,
-      "^HEAD",
-    ]);
-    if (!stdout) {
-      throw new Error(`No unique commits found in ${patchName}`);
-    }
-
-    await execa("git", ["cherry-pick", "-n", stdout.trim()]);
-
-    // Update patch config to track the applied patch
-    config.appliedPatches.push(patchName);
-    await savePatchConfig(config);
-
-    // Commit the changes including the .patches file
-    await execa("git", ["add", "."]);
-    await execa("git", ["commit", "-m", `Applied patch: ${patchName}`]);
-
-    console.log(`Successfully applied patch: ${patchName}`);
-  } catch (e) {
-    throw new Error(`Failed to apply patch ${patchName}: ${e.message}`);
+  if (config.appliedPatches.includes(patchName)) {
+    console.log(`Patch ${patchName} is already applied`);
+    return;
   }
+
+  const commit = await execGit(
+    ["rev-list", "-n", "1", `${PATCHES_REMOTE}/${patchName}`, "^HEAD"],
+    `Failed to find commit for patch ${patchName}`
+  );
+
+  if (!commit) {
+    throw new Error(`No unique commits found in ${patchName}`);
+  }
+
+  await execGit(["cherry-pick", "-n", commit], "Failed to cherry-pick commit");
+
+  config.appliedPatches.push(patchName);
+  await savePatchConfig(config);
+
+  await execGit(["add", "."], "Failed to stage changes");
+  await execGit(
+    ["commit", "-m", `Applied patch: ${patchName}`],
+    "Failed to commit changes"
+  );
+
+  console.log(`Successfully applied patch: ${patchName}`);
 }
 
 async function removePatch(patchName) {
-  try {
-    const config = await getPatchConfig();
+  const config = await getPatchConfig();
 
-    if (!config.appliedPatches.includes(patchName)) {
-      console.log(`Patch ${patchName} is not applied`);
-      return;
-    }
+  if (!config.appliedPatches.includes(patchName)) {
+    console.log(`Patch ${patchName} is not applied`);
+    return;
+  }
 
-    // Get the base branch (dev or main)
-    const { stdout: branches } = await execa("git", ["branch", "-a"]);
-    const hasDev = branches.includes("dev");
-    const baseBranch = hasDev ? "dev" : "main";
+  const baseBranch = await getBaseBranch();
+  const currentCommit = await execGit(
+    ["rev-parse", "HEAD"],
+    "Failed to get current commit"
+  );
+  const tempBranch = `temp-${Date.now()}`;
 
-    // Store current branch state
-    const { stdout: currentCommit } = await execa("git", ["rev-parse", "HEAD"]);
+  await execGit(["branch", tempBranch], "Failed to create temp branch");
+  await execGit(
+    ["reset", "--hard", baseBranch],
+    "Failed to reset to base branch"
+  );
 
-    // Create a temporary branch to store current state
-    const tempBranch = `temp-${Date.now()}`;
-    await execa("git", ["branch", tempBranch]);
+  const commits = await execGit(
+    ["log", `${baseBranch}..${tempBranch}`, "--format=%H %s"],
+    "Failed to get commit list"
+  );
 
-    // Reset to base branch
-    await execa("git", ["reset", "--hard", baseBranch]);
+  const commitList = commits.split("\n").reverse().filter(Boolean);
 
-    // Cherry-pick all commits from the temp branch except the patch we want to remove
-    const { stdout: commits } = await execa("git", [
-      "log",
-      `${baseBranch}..${tempBranch}`,
-      "--format=%H %s",
-    ]);
-    const commitList = commits.split("\n").reverse().filter(Boolean);
+  for (const commit of commitList) {
+    const [hash, ...messageParts] = commit.split(" ");
+    const message = messageParts.join(" ");
 
-    for (const commit of commitList) {
-      const [hash, ...messageParts] = commit.split(" ");
-      const message = messageParts.join(" ");
-
-      // Skip the commit that applied this patch
-      if (!message.includes(`Applied patch: ${patchName}`)) {
-        try {
-          await execa("git", ["cherry-pick", hash]);
-        } catch (cherryPickError) {
-          // If cherry-pick fails, abort and cleanup
-          await execa("git", ["cherry-pick", "--abort"]);
-          await execa("git", ["branch", "-D", tempBranch]);
-          throw new Error(
-            `Failed to cherry-pick commit ${hash}: ${cherryPickError.message}`
-          );
-        }
+    if (!message.includes(`Applied patch: ${patchName}`)) {
+      try {
+        await execGit(["cherry-pick", hash], "Failed to cherry-pick commit");
+      } catch (e) {
+        await execGit(
+          ["cherry-pick", "--abort"],
+          "Failed to abort cherry-pick"
+        );
+        await execGit(
+          ["branch", "-D", tempBranch],
+          "Failed to delete temp branch"
+        );
+        throw new Error(`Failed to cherry-pick commit ${hash}: ${e.message}`);
       }
     }
-
-    // Clean up temporary branch
-    await execa("git", ["branch", "-D", tempBranch]);
-
-    // Update patch config to remove the patch from tracking
-    config.appliedPatches = config.appliedPatches.filter(
-      (p) => p !== patchName
-    );
-    await savePatchConfig(config);
-
-    console.log(`Successfully removed patch: ${patchName}`);
-  } catch (e) {
-    throw new Error(`Failed to remove patch ${patchName}: ${e.message}`);
   }
+
+  await execGit(["branch", "-D", tempBranch], "Failed to delete temp branch");
+
+  config.appliedPatches = config.appliedPatches.filter((p) => p !== patchName);
+  await savePatchConfig(config);
+
+  console.log(`Successfully removed patch: ${patchName}`);
 }
+
 async function listPatches() {
-  try {
-    const config = await getPatchConfig();
+  const config = await getPatchConfig();
 
-    console.log("\nCurrently applied patches:");
-    if (config.appliedPatches.length === 0) {
-      console.log("  No patches applied");
-    } else {
-      config.appliedPatches.forEach((patch) => console.log(`  - ${patch}`));
-    }
-  } catch (e) {
-    throw new Error(`Failed to list patches: ${e.message}`);
+  console.log("\nCurrently applied patches:");
+  if (config.appliedPatches.length === 0) {
+    console.log("  No patches applied");
+  } else {
+    config.appliedPatches.forEach((patch) => console.log(`  - ${patch}`));
   }
 }
 
+// Installation management
 async function ensureGlobalLink() {
   try {
     await execa("npm", ["link"], { cwd: path.join(__dirname, "..") });
@@ -238,6 +228,58 @@ async function ensureGlobalLink() {
   }
 }
 
+async function nukePatches() {
+  const baseBranch = await getBaseBranch();
+  await execGit(["checkout", baseBranch], "Failed to checkout base branch");
+
+  try {
+    await execGit(["branch", "-D", BRANCH_NAME], "Failed to delete branch");
+    console.log(`Deleted branch ${BRANCH_NAME}`);
+  } catch (e) {
+    console.log(`Branch ${BRANCH_NAME} does not exist`);
+  }
+
+  try {
+    await execGit(
+      ["remote", "remove", PATCHES_REMOTE],
+      "Failed to remove remote"
+    );
+    console.log(`Removed remote ${PATCHES_REMOTE}`);
+  } catch (e) {
+    console.log(`Remote ${PATCHES_REMOTE} does not exist`);
+  }
+
+  try {
+    await execa("npm", ["unlink"], { cwd: path.join(__dirname, "..") });
+    console.log("Removed global command link");
+  } catch (e) {
+    console.log("Global command link does not exist");
+  }
+
+  console.log("Nuke completed successfully!");
+}
+
+async function resetPatches() {
+  const baseBranch = await getBaseBranch();
+  console.log("Removing all patches and upgrading to latest base version...");
+
+  await execGit(["checkout", baseBranch], "Failed to checkout base branch");
+  try {
+    await execGit(["branch", "-D", BRANCH_NAME], "Failed to delete branch");
+    console.log(`Deleted branch ${BRANCH_NAME}`);
+  } catch (e) {
+    console.log(`Branch ${BRANCH_NAME} does not exist`);
+  }
+
+  await syncBranches();
+  await ensurePatchBranch();
+  await setupPatchesRemote();
+
+  console.log("Reset completed successfully!");
+  await listPatches();
+}
+
+// CLI commands setup
 program
   .name(PACKAGE_NAME)
   .description("Patch management system for game engine")
@@ -250,10 +292,9 @@ program
     try {
       await verifyRepo();
       const baseBranch = await syncBranches();
-      await ensurePatchBranch(baseBranch);
-
+      await ensurePatchBranch();
       await execa("npm", ["install"]);
-      ensureGlobalLink();
+      await ensureGlobalLink();
       console.log("Patch management system installed successfully!");
       await listPatches();
     } catch (e) {
@@ -300,57 +341,26 @@ program
     }
   });
 
-async function resetPatches() {
-  try {
-    // First checkout to the base branch (dev or main)
-    const { stdout: branches } = await execa("git", ["branch", "-a"]);
-    const hasDev = branches.includes("dev");
-    const baseBranch = hasDev ? "dev" : "main";
-
-    // Make sure we're on the base branch before deleting
-    await execa("git", ["checkout", baseBranch]);
-
-    // Try to delete the patches branch
-    try {
-      await execa("git", ["branch", "-D", BRANCH_NAME]);
-      console.log(`Deleted branch ${BRANCH_NAME}`);
-    } catch (e) {
-      // Branch might not exist, that's okay
-      console.log(`Branch ${BRANCH_NAME} does not exist`);
-    }
-
-    // Try to remove the remote
-    try {
-      await execa("git", ["remote", "remove", PATCHES_REMOTE]);
-      console.log(`Removed remote ${PATCHES_REMOTE}`);
-    } catch (e) {
-      // Remote might not exist, that's okay
-      console.log(`Remote ${PATCHES_REMOTE} does not exist`);
-    }
-
-    // Try to unlink the global command
-    try {
-      await execa("npm", ["unlink"], { cwd: path.join(__dirname, "..") });
-      console.log("Removed global command link");
-    } catch (e) {
-      // Command might not be linked, that's okay
-      console.log("Global command link does not exist");
-    }
-
-    console.log("Reset completed successfully!");
-  } catch (e) {
-    throw new Error(`Failed to reset patches: ${e.message}`);
-  }
-}
-// Add the new command to the program
 program
   .command("reset")
-  .description("Reset patches by removing the patch branch and remote")
+  .description("Remove all patches and upgrade to latest base version")
   .action(async () => {
     try {
       await resetPatches();
     } catch (e) {
       console.error(`Reset failed: ${e.message}`);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("nuke")
+  .description("Remove everything: patches, branch, remote, and global command")
+  .action(async () => {
+    try {
+      await nukePatches();
+    } catch (e) {
+      console.error(`Nuke failed: ${e.message}`);
       process.exit(1);
     }
   });
