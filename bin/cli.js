@@ -229,6 +229,41 @@ async function listPatches() {
   }
 }
 
+async function createLocalBinLink() {
+  try {
+    // Create node_modules/.bin if it doesn't exist
+    const binDir = path.join(process.cwd(), "node_modules", ".bin");
+    await fs.mkdir(binDir, { recursive: true });
+
+    // Get the absolute path to our CLI script
+    const cliPath = path.join(
+      process.cwd(),
+      "node_modules",
+      PACKAGE_NAME,
+      "bin",
+      "cli.js"
+    );
+    const localBinPath = path.join(binDir, PACKAGE_NAME);
+
+    // Create symlink
+    try {
+      await fs.symlink(cliPath, localBinPath);
+      console.log(`Created local binary link: ${PACKAGE_NAME}`);
+    } catch (e) {
+      if (e.code === "EEXIST") {
+        console.log("Local binary link already exists");
+      } else {
+        throw e;
+      }
+    }
+
+    // Make the CLI file executable
+    await fs.chmod(cliPath, "755");
+  } catch (e) {
+    throw new Error(`Failed to create local binary link: ${e.message}`);
+  }
+}
+
 program
   .name(PACKAGE_NAME)
   .description("Patch management system for game engine")
@@ -244,6 +279,7 @@ program
       await ensurePatchBranch(baseBranch);
 
       // await execa('npm', ['install']);
+      createLocalBinLink();
       console.log("Patch management system installed successfully!");
       await listPatches();
     } catch (e) {
@@ -286,6 +322,53 @@ program
       await listPatches();
     } catch (e) {
       console.error(`Failed to list patches: ${e.message}`);
+      process.exit(1);
+    }
+  });
+
+async function resetPatches() {
+  try {
+    // First checkout to the base branch (dev or main)
+    const { stdout: branches } = await execa("git", ["branch", "-a"]);
+    const hasDev = branches.includes("dev");
+    const baseBranch = hasDev ? "dev" : "main";
+
+    // Make sure we're on the base branch before deleting
+    await execa("git", ["checkout", baseBranch]);
+
+    // Try to delete the patches branch
+    try {
+      await execa("git", ["branch", "-D", BRANCH_NAME]);
+      console.log(`Deleted branch ${BRANCH_NAME}`);
+    } catch (e) {
+      // Branch might not exist, that's okay
+      console.log(`Branch ${BRANCH_NAME} does not exist`);
+    }
+
+    // Try to remove the remote
+    try {
+      await execa("git", ["remote", "remove", PATCHES_REMOTE]);
+      console.log(`Removed remote ${PATCHES_REMOTE}`);
+    } catch (e) {
+      // Remote might not exist, that's okay
+      console.log(`Remote ${PATCHES_REMOTE} does not exist`);
+    }
+
+    console.log("Reset completed successfully!");
+  } catch (e) {
+    throw new Error(`Failed to reset patches: ${e.message}`);
+  }
+}
+
+// Add the new command to the program
+program
+  .command("reset")
+  .description("Reset patches by removing the patch branch and remote")
+  .action(async () => {
+    try {
+      await resetPatches();
+    } catch (e) {
+      console.error(`Reset failed: ${e.message}`);
       process.exit(1);
     }
   });
