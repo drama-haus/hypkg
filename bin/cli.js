@@ -12,6 +12,66 @@ const TARGET_REPO = packageJson.config.targetRepo;
 const PACKAGE_NAME = packageJson.name;
 const BRANCH_NAME = PACKAGE_NAME;
 
+// Git state management
+async function saveGitState() {
+  const currentBranch = await getCurrentBranch();
+  const stashName = `backup-${Date.now()}`;
+  const hasChanges =
+    (await execGit(["status", "--porcelain"], "Failed to check git status"))
+      .length > 0;
+
+  if (hasChanges) {
+    await execGit(
+      ["stash", "push", "-m", stashName],
+      "Failed to stash changes"
+    );
+  }
+
+  return {
+    branch: currentBranch,
+    stashName: hasChanges ? stashName : null,
+    commit: await execGit(
+      ["rev-parse", "HEAD"],
+      "Failed to get current commit"
+    ),
+  };
+}
+
+async function restoreGitState(state) {
+  // First, reset any half-applied changes
+  await execGit(["reset", "--hard", "HEAD"], "Failed to reset changes");
+
+  // Checkout original branch
+  await execGit(
+    ["checkout", state.branch],
+    "Failed to restore original branch"
+  );
+
+  // Reset to original commit
+  await execGit(
+    ["reset", "--hard", state.commit],
+    "Failed to reset to original commit"
+  );
+
+  // Restore stashed changes if any
+  if (state.stashName) {
+    const stashList = await execGit(
+      ["stash", "list"],
+      "Failed to list stashes"
+    );
+    const stashIndex = stashList
+      .split("\n")
+      .findIndex((line) => line.includes(state.stashName));
+
+    if (stashIndex !== -1) {
+      await execGit(
+        ["stash", "pop", `stash@{${stashIndex}}`],
+        "Failed to restore stashed changes"
+      );
+    }
+  }
+}
+
 // Git utilities
 async function execGit(args, errorMessage) {
   try {
@@ -119,92 +179,148 @@ async function ensurePatchBranch() {
 }
 
 // Patch operations
+async function handlePackageChanges() {
+  const packageLockExists = await fs
+    .access("package-lock.json")
+    .then(() => true)
+    .catch(() => false);
+
+  if (packageLockExists) {
+    await fs.unlink("package-lock.json");
+  }
+
+  try {
+    await execa("npm", ["install"]);
+  } catch (e) {
+    throw new Error(`Failed to run npm install: ${e.message}`);
+  }
+}
+
 async function applyPatch(patchName) {
   const config = await getPatchConfig();
+  const initialState = await saveGitState();
 
   if (config.appliedPatches.includes(patchName)) {
     console.log(`Patch ${patchName} is already applied`);
     return;
   }
 
-  const commit = await execGit(
-    ["rev-list", "-n", "1", `${PATCHES_REMOTE}/${patchName}`, "^HEAD"],
-    `Failed to find commit for patch ${patchName}`
-  );
+  try {
+    const commit = await execGit(
+      ["rev-list", "-n", "1", `${PATCHES_REMOTE}/${patchName}`, "^HEAD"],
+      `Failed to find commit for patch ${patchName}`
+    );
 
-  if (!commit) {
-    throw new Error(`No unique commits found in ${patchName}`);
+    if (!commit) {
+      throw new Error(`No unique commits found in ${patchName}`);
+    }
+
+    try {
+      // Try normal cherry-pick first
+      await execGit(["cherry-pick", commit], "Failed to cherry-pick commit");
+    } catch (cherryPickError) {
+      // If it fails, abort and try the package-lock.json handling approach
+      await execGit(["cherry-pick", "--abort"], "Failed to abort cherry-pick");
+
+      // Try cherry-pick without committing
+      await execGit(
+        ["cherry-pick", "-n", commit],
+        "Failed to cherry-pick commit"
+      );
+
+      // Handle package-lock.json and npm install
+      await handlePackageChanges();
+
+      // Stage and commit all changes
+      await execGit(["add", "."], "Failed to stage changes");
+      await execGit(
+        ["commit", "-m", `Applied patch: ${patchName}`],
+        "Failed to commit changes"
+      );
+    }
+
+    // Update config only after successful patch application
+    config.appliedPatches.push(patchName);
+    await savePatchConfig(config);
+
+    console.log(`Successfully applied patch: ${patchName}`);
+  } catch (error) {
+    console.error(
+      `Error while applying patch, rolling back to initial state...`
+    );
+    await restoreGitState(initialState);
+    throw error;
   }
-
-  await execGit(["cherry-pick", "-n", commit], "Failed to cherry-pick commit");
-
-  config.appliedPatches.push(patchName);
-  await savePatchConfig(config);
-
-  await execGit(["add", "."], "Failed to stage changes");
-  await execGit(
-    ["commit", "-m", `Applied patch: ${patchName}`],
-    "Failed to commit changes"
-  );
-
-  console.log(`Successfully applied patch: ${patchName}`);
 }
 
 async function removePatch(patchName) {
   const config = await getPatchConfig();
+  const initialState = await saveGitState();
 
   if (!config.appliedPatches.includes(patchName)) {
     console.log(`Patch ${patchName} is not applied`);
     return;
   }
 
-  const baseBranch = await getBaseBranch();
-  const currentCommit = await execGit(
-    ["rev-parse", "HEAD"],
-    "Failed to get current commit"
-  );
-  const tempBranch = `temp-${Date.now()}`;
+  try {
+    const baseBranch = await getBaseBranch();
+    const tempBranch = `temp-${Date.now()}`;
 
-  await execGit(["branch", tempBranch], "Failed to create temp branch");
-  await execGit(
-    ["reset", "--hard", baseBranch],
-    "Failed to reset to base branch"
-  );
+    await execGit(["branch", tempBranch], "Failed to create temp branch");
+    await execGit(
+      ["reset", "--hard", baseBranch],
+      "Failed to reset to base branch"
+    );
 
-  const commits = await execGit(
-    ["log", `${baseBranch}..${tempBranch}`, "--format=%H %s"],
-    "Failed to get commit list"
-  );
+    const commits = await execGit(
+      ["log", `${baseBranch}..${tempBranch}`, "--format=%H %s"],
+      "Failed to get commit list"
+    );
 
-  const commitList = commits.split("\n").reverse().filter(Boolean);
+    const commitList = commits.split("\n").reverse().filter(Boolean);
 
-  for (const commit of commitList) {
-    const [hash, ...messageParts] = commit.split(" ");
-    const message = messageParts.join(" ");
+    for (const commit of commitList) {
+      const [hash, ...messageParts] = commit.split(" ");
+      const message = messageParts.join(" ");
 
-    if (!message.includes(`Applied patch: ${patchName}`)) {
-      try {
-        await execGit(["cherry-pick", hash], "Failed to cherry-pick commit");
-      } catch (e) {
-        await execGit(
-          ["cherry-pick", "--abort"],
-          "Failed to abort cherry-pick"
-        );
-        await execGit(
-          ["branch", "-D", tempBranch],
-          "Failed to delete temp branch"
-        );
-        throw new Error(`Failed to cherry-pick commit ${hash}: ${e.message}`);
+      if (!message.includes(`Applied patch: ${patchName}`)) {
+        try {
+          await execGit(["cherry-pick", hash], "Failed to cherry-pick commit");
+        } catch (e) {
+          // If cherry-pick fails, try the package-lock.json handling approach
+          await execGit(
+            ["cherry-pick", "--abort"],
+            "Failed to abort cherry-pick"
+          );
+          await execGit(
+            ["cherry-pick", "-n", hash],
+            "Failed to cherry-pick commit"
+          );
+          await handlePackageChanges();
+          await execGit(["add", "."], "Failed to stage changes");
+          await execGit(["commit", "-m", message], "Failed to commit changes");
+        }
       }
     }
+
+    await execGit(["branch", "-D", tempBranch], "Failed to delete temp branch");
+
+    // Update package dependencies after all patches are reapplied
+    await handlePackageChanges();
+
+    config.appliedPatches = config.appliedPatches.filter(
+      (p) => p !== patchName
+    );
+    await savePatchConfig(config);
+
+    console.log(`Successfully removed patch: ${patchName}`);
+  } catch (error) {
+    console.error(
+      `Error while removing patch, rolling back to initial state...`
+    );
+    await restoreGitState(initialState);
+    throw error;
   }
-
-  await execGit(["branch", "-D", tempBranch], "Failed to delete temp branch");
-
-  config.appliedPatches = config.appliedPatches.filter((p) => p !== patchName);
-  await savePatchConfig(config);
-
-  console.log(`Successfully removed patch: ${patchName}`);
 }
 
 async function listPatches() {
@@ -361,135 +477,6 @@ program
       await nukePatches();
     } catch (e) {
       console.error(`Nuke failed: ${e.message}`);
-      process.exit(1);
-    }
-  });
-
-async function searchPatches(searchTerm = "") {
-  const branches = await execGit(
-    ["branch", "-a"],
-    "Failed to list all branches"
-  );
-
-  const remoteBranches = branches
-    .split("\n")
-    .map((b) => b.trim())
-    .filter((b) => b.startsWith(`remotes/${PATCHES_REMOTE}/${PACKAGE_NAME}`))
-    .map((b) => b.replace(`remotes/${PATCHES_REMOTE}/`, ""));
-
-  if (searchTerm) {
-    return remoteBranches.filter((b) => b.includes(searchTerm));
-  }
-  return remoteBranches;
-}
-
-async function getBranchDiff(branchName) {
-  const baseBranch = await getBaseBranch();
-  return execGit(
-    ["diff", `${baseBranch}...${branchName}`, "--name-only"],
-    "Failed to get branch diff"
-  );
-}
-
-async function publishPatch(branchName) {
-  // Verify we're on the correct branch
-  const currentBranch = await getCurrentBranch();
-  if (currentBranch !== branchName) {
-    throw new Error(
-      `Not on branch ${branchName}. Please checkout the branch first.`
-    );
-  }
-
-  const patchBranchName = `${PACKAGE_NAME}_${branchName}`;
-
-  // Check if patch branch already exists
-  const existingBranches = await searchPatches();
-  if (existingBranches.includes(patchBranchName)) {
-    // Compare diffs
-    const existingDiff = await getBranchDiff(
-      `${PATCHES_REMOTE}/${patchBranchName}`
-    );
-    const currentDiff = await getBranchDiff(branchName);
-
-    if (existingDiff === currentDiff) {
-      console.log(
-        `Patch ${patchBranchName} already exists with the same changes.`
-      );
-      return;
-    }
-
-    throw new Error(
-      `Patch ${patchBranchName} already exists with different changes.`
-    );
-  }
-
-  // Create new branch for the patch
-  await execGit(
-    ["checkout", "-b", patchBranchName],
-    "Failed to create patch branch"
-  );
-
-  // Get the base branch commit
-  const baseBranch = await getBaseBranch();
-  const baseCommit = await execGit(
-    ["merge-base", baseBranch, branchName],
-    "Failed to find merge base"
-  );
-
-  // Squash all commits since the base branch
-  await execGit(
-    ["reset", "--soft", baseCommit],
-    "Failed to reset to base commit"
-  );
-
-  // Create single commit with all changes
-  await execGit(
-    ["commit", "-m", `Patch: ${branchName}`],
-    "Failed to create patch commit"
-  );
-
-  // Push to remote
-  await execGit(
-    ["push", "-u", PATCHES_REMOTE, patchBranchName],
-    "Failed to push patch branch"
-  );
-
-  // Return to original branch
-  await execGit(
-    ["checkout", branchName],
-    "Failed to return to development branch"
-  );
-
-  console.log(`Successfully published patch: ${patchBranchName}`);
-}
-
-// Add new commands to the CLI
-program
-  .command("publish <branchName>")
-  .description("Publish current branch as a patch")
-  .action(async (branchName) => {
-    try {
-      await publishPatch(branchName);
-    } catch (e) {
-      console.error(`Failed to publish patch: ${e.message}`);
-      process.exit(1);
-    }
-  });
-
-program
-  .command("search [patchName]")
-  .description("Search for patches (lists all if no name provided)")
-  .action(async (patchName) => {
-    try {
-      const patches = await searchPatches(patchName);
-      console.log("\nAvailable patches:");
-      if (patches.length === 0) {
-        console.log("  No patches found");
-      } else {
-        patches.forEach((patch) => console.log(`  - ${patch}`));
-      }
-    } catch (e) {
-      console.error(`Failed to search patches: ${e.message}`);
       process.exit(1);
     }
   });
