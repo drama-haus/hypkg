@@ -1,6 +1,6 @@
 {
   "name": "hucow",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "description": "Apply patches from hyperfy user branches",
   "bin": {
     "hucow": "./bin/wrapper.js"
