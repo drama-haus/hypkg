@@ -1,0 +1,23 @@
+{
+  "name": "hucow",
+  "version": "1.0.0",
+  "description": "Apply patches from hyperfy user branches",
+  "main": "index.js",
+  "bin": {
+    "hucow": "./bin/cli.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "itspeezy",
+  "license": "MIT",
+  "dependencies": {
+    "execa": "^5.1.1",
+    "commander": "^11.0.0"
+  },
+  "config": {
+    "patchesRepo": "https://github.com/drama-haus/hyperfy.git",
+    "patchesRemoteName": "drama.haus",
+    "targetRepo": "https://github.com/hyperfy-xyz/hyperfy.git"
+  }
+}
