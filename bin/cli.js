@@ -231,10 +231,10 @@ async function listPatches() {
 
 async function ensureGlobalLink() {
   try {
-      await execa('npm', ['link'], { cwd: path.join(__dirname, '..') });
-      console.log('Global command link created successfully');
+    await execa("npm", ["link"], { cwd: path.join(__dirname, "..") });
+    console.log("Global command link created successfully");
   } catch (e) {
-      throw new Error(`Failed to create global command link: ${e.message}`);
+    throw new Error(`Failed to create global command link: ${e.message}`);
   }
 }
 
@@ -252,7 +252,7 @@ program
       const baseBranch = await syncBranches();
       await ensurePatchBranch(baseBranch);
 
-      await execa('npm', ['install']);
+      await execa("npm", ["install"]);
       ensureGlobalLink();
       console.log("Patch management system installed successfully!");
       await listPatches();
@@ -328,12 +328,20 @@ async function resetPatches() {
       console.log(`Remote ${PATCHES_REMOTE} does not exist`);
     }
 
+    // Try to unlink the global command
+    try {
+      await execa("npm", ["unlink"], { cwd: path.join(__dirname, "..") });
+      console.log("Removed global command link");
+    } catch (e) {
+      // Command might not be linked, that's okay
+      console.log("Global command link does not exist");
+    }
+
     console.log("Reset completed successfully!");
   } catch (e) {
     throw new Error(`Failed to reset patches: ${e.message}`);
   }
 }
-
 // Add the new command to the program
 program
   .command("reset")

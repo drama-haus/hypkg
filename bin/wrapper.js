@@ -3,9 +3,6 @@ const path = require("path");
 const fs = require("fs").promises;
 const { execSync } = require("child_process");
 
-const packageJson = require(path.join(__dirname, "..", "package.json"));
-const TARGET_REPO = packageJson.config.targetRepo;
-
 // Detect if running through npx by checking if we're in a temporary npm directory
 function isRunningThroughNPX() {
   return (
@@ -51,12 +48,8 @@ async function findLocalCLI(gitRoot) {
     await fs.access(cliPath);
     return cliPath;
   } catch (e) {
-    if (isRunningThroughNPX()) {
-      // If running through npx, use the current CLI script
-      return path.join(__dirname, "cli.js");
-    }
     throw new Error(
-      "hucow is not installed in this project. Please run: npx hucow install"
+      "hucow is not installed in this project. Please run: npx hucow"
     );
   }
 }
@@ -64,12 +57,19 @@ async function findLocalCLI(gitRoot) {
 async function main() {
   try {
     if (isRunningThroughNPX()) {
-      // If running through npx, just execute the CLI directly
+      // If running through npx with no arguments, run install
+      if (process.argv.length === 2) {
+        const cliPath = path.join(__dirname, "cli.js");
+        process.argv.push("install");
+        require(cliPath);
+        return;
+      }
+      // If running through npx with arguments, just execute the CLI
       require(path.join(__dirname, "cli.js"));
       return;
     }
 
-    // Otherwise check we're in the right repo and have local installation
+    // For direct hucow command, check repo and show usage
     const gitRoot = await findGitRoot();
     await verifyGameEngineRepo(gitRoot);
     const cliPath = await findLocalCLI(gitRoot);
