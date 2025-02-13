@@ -3,8 +3,12 @@ const path = require("path");
 const fs = require("fs").promises;
 const { execSync } = require("child_process");
 
-const packageJson = require(path.join(__dirname, "..", "package.json"));
-const TARGET_REPO = packageJson.config.targetRepo;
+// Detect if running through npx by checking if we're in a temporary npm directory
+function isRunningThroughNPX() {
+  return (
+    process.cwd().includes("_npx/") || process.env.npm_lifecycle_event === "npx"
+  );
+}
 
 async function findGitRoot() {
   try {
@@ -24,7 +28,6 @@ async function verifyGameEngineRepo(gitRoot) {
       cwd: gitRoot,
     }).trim();
 
-    // Use the same TARGET_REPO check from your original code
     if (!remote.includes(TARGET_REPO.replace(".git", ""))) {
       throw new Error("Not in the game engine repository");
     }
@@ -45,23 +48,34 @@ async function findLocalCLI(gitRoot) {
     await fs.access(cliPath);
     return cliPath;
   } catch (e) {
+    if (isRunningThroughNPX()) {
+      // If running through npx, use the current CLI script
+      return path.join(__dirname, "cli.js");
+    }
     throw new Error(
-      "hucow is not installed in this project. Please run npm install"
+      "hucow is not installed in this project. Please run: npx hucow install"
     );
   }
 }
 
 async function main() {
   try {
+    if (isRunningThroughNPX()) {
+      // If running through npx, just execute the CLI directly
+      require(path.join(__dirname, "cli.js"));
+      return;
+    }
+
+    // Otherwise check we're in the right repo and have local installation
     const gitRoot = await findGitRoot();
     await verifyGameEngineRepo(gitRoot);
     const cliPath = await findLocalCLI(gitRoot);
     require(cliPath);
   } catch (e) {
     console.error(`Error: ${e.message}`);
-    console.error(
-      "Please ensure you are in the game engine repository and have run npm install"
-    );
+    if (!isRunningThroughNPX()) {
+      console.error("Please ensure you are in the game engine repository");
+    }
     process.exit(1);
   }
 }
