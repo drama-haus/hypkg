@@ -374,7 +374,11 @@ async function listPatches() {
   if (config.appliedPatches.length === 0) {
     console.log("  No patches applied");
   } else {
-    config.appliedPatches.forEach((patch) => console.log(`  - ${patch}`));
+    for (const patch of config.appliedPatches) {
+      const displayName = patch.replace(`${PACKAGE_NAME}_`, "");
+      const { author, relativeTime } = await getPatchInfo(displayName);
+      console.log(`  - ${displayName} (by ${author}, ${relativeTime})`);
+    }
   }
 }
 
@@ -468,7 +472,11 @@ program
   .description("Apply a specific patch")
   .action(async (patchName) => {
     try {
-      await applyPatch(patchName);
+      // Remove package prefix if it's already there
+      const cleanPatchName = patchName.startsWith(`${PACKAGE_NAME}_`)
+        ? patchName
+        : `${PACKAGE_NAME}_${patchName}`;
+      await applyPatch(cleanPatchName);
       await listPatches();
     } catch (e) {
       console.error(`Failed to apply patch: ${e.message}`);
@@ -481,7 +489,11 @@ program
   .description("Remove a specific patch")
   .action(async (patchName) => {
     try {
-      await removePatch(patchName);
+      // Remove package prefix if it's already there
+      const cleanPatchName = patchName.startsWith(`${PACKAGE_NAME}_`)
+        ? patchName
+        : `${PACKAGE_NAME}_${patchName}`;
+      await removePatch(cleanPatchName);
       await listPatches();
     } catch (e) {
       console.error(`Failed to remove patch: ${e.message}`);
@@ -535,7 +547,9 @@ async function searchPatches(searchTerm = "") {
     .split("\n")
     .map((b) => b.trim())
     .filter((b) => b.startsWith(`remotes/${PATCHES_REMOTE}/${PACKAGE_NAME}`))
-    .map((b) => b.replace(`remotes/${PATCHES_REMOTE}/`, ""));
+    .filter((b) => !b.endsWith("-base")) // Filter out base branch
+    .map((b) => b.replace(`remotes/${PATCHES_REMOTE}/`, ""))
+    .map((b) => b.replace(`${PACKAGE_NAME}_`, "")); // Remove package prefix
 
   if (searchTerm) {
     return remoteBranches.filter((b) => b.includes(searchTerm));
@@ -543,12 +557,39 @@ async function searchPatches(searchTerm = "") {
   return remoteBranches;
 }
 
-async function getBranchDiff(branchName) {
-  const baseBranch = await getBaseBranch();
-  return execGit(
-    ["diff", `${baseBranch}...${branchName}`, "--name-only"],
-    "Failed to get branch diff"
+function getRelativeTime(timestamp) {
+  const diff = Date.now() - timestamp;
+  const seconds = Math.floor(diff / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+  const weeks = Math.floor(days / 7);
+  const months = Math.floor(days / 30);
+  const years = Math.floor(days / 365);
+
+  if (years > 0) return `${years}y ago`;
+  if (months > 0) return `${months}mo ago`;
+  if (weeks > 0) return `${weeks}w ago`;
+  if (days > 0) return `${days}d ago`;
+  if (hours > 0) return `${hours}h ago`;
+  if (minutes > 0) return `${minutes}m ago`;
+  return `${seconds}s ago`;
+}
+
+async function getPatchInfo(branchName) {
+  const fullBranchName = `${PATCHES_REMOTE}/${PACKAGE_NAME}_${branchName}`;
+  const commitInfo = await execGit(
+    ["log", "-1", "--format=%an|%at", fullBranchName],
+    `Failed to get commit info for ${branchName}`
   );
+
+  const [author, timestamp] = commitInfo.split("|");
+  const relativeTime = getRelativeTime(parseInt(timestamp) * 1000);
+
+  return {
+    author,
+    relativeTime,
+  };
 }
 
 async function publishPatch(branchName) {
@@ -646,7 +687,10 @@ program
       if (patches.length === 0) {
         console.log("  No patches found");
       } else {
-        patches.forEach((patch) => console.log(`  - ${patch}`));
+        for (const patch of patches) {
+          const { author, relativeTime } = await getPatchInfo(patch);
+          console.log(`  - ${patch} (by ${author}, ${relativeTime})`);
+        }
       }
     } catch (e) {
       console.error(`Failed to search patches: ${e.message}`);
