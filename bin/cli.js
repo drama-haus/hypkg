@@ -4,65 +4,6 @@ const { program } = require("commander");
 const execa = require("execa");
 const path = require("path");
 const fs = require("fs").promises;
-const https = require("https");
-
-async function getForksList() {
-  const repoPath = TARGET_REPO.match(/github\.com\/(.+?)(?:\.git)?$/)[1];
-
-  return new Promise((resolve, reject) => {
-    const options = {
-      hostname: "api.github.com",
-      path: `/repos/${repoPath}/forks`,
-      headers: {
-        "User-Agent": PACKAGE_NAME,
-        Accept: "application/vnd.github.v3+json",
-      },
-    };
-
-    https
-      .get(options, (res) => {
-        let data = "";
-        res.on("data", (chunk) => (data += chunk));
-        res.on("end", () => {
-          try {
-            const forks = JSON.parse(data);
-            resolve(
-              forks.map((fork) => ({
-                name: fork.owner.login,
-                cloneUrl: fork.clone_url,
-              }))
-            );
-          } catch (e) {
-            reject(
-              new Error(`Failed to parse GitHub API response: ${e.message}`)
-            );
-          }
-        });
-      })
-      .on("error", reject);
-  });
-}
-
-// Add this function to manage remotes
-async function setupForkRemotes() {
-  const forks = await getForksList();
-  const existingRemotes = (
-    await execGit(["remote"], "Failed to list remotes")
-  ).split("\n");
-
-  for (const fork of forks) {
-    const remoteName = `fork-${fork.name}`;
-    if (!existingRemotes.includes(remoteName)) {
-      await execGit(
-        ["remote", "add", remoteName, fork.cloneUrl],
-        `Failed to add remote for ${fork.name}`
-      );
-    }
-    await execGit(["fetch", remoteName], `Failed to fetch from ${fork.name}`);
-  }
-
-  return forks.map((fork) => `fork-${fork.name}`);
-}
 
 const packageJson = require(path.join(__dirname, "..", "package.json"));
 const PATCHES_REPO = packageJson.config.patchesRepo;
@@ -597,59 +538,23 @@ program
   });
 
 async function searchPatches(searchTerm = "") {
-  // Get all fork remotes
-  const forkRemotes = await setupForkRemotes();
-  const allPatches = [];
-
-  // Function to get patches from a specific remote
-  async function getPatchesFromRemote(remote) {
-    const branches = await execGit(
-      ["branch", "-a"],
-      `Failed to list branches for ${remote}`
-    );
-
-    return branches
-      .split("\n")
-      .map((b) => b.trim())
-      .filter((b) => b.startsWith(`remotes/${remote}/${PACKAGE_NAME}`))
-      .filter((b) => !b.endsWith("-base"))
-      .map((b) => ({
-        name: b
-          .replace(`remotes/${remote}/`, "")
-          .replace(`${PACKAGE_NAME}_`, ""),
-        remote: remote,
-      }));
-  }
-
-  // Get patches from original patches remote
-  const originalPatches = await getPatchesFromRemote(PATCHES_REMOTE);
-  allPatches.push(
-    ...originalPatches.map((p) => ({ ...p, source: "original" }))
+  const branches = await execGit(
+    ["branch", "-a"],
+    "Failed to list all branches"
   );
 
-  // Get patches from each fork
-  for (const remote of forkRemotes) {
-    try {
-      const forkPatches = await getPatchesFromRemote(remote);
-      allPatches.push(
-        ...forkPatches.map((p) => ({
-          ...p,
-          source: remote.replace("fork-", ""),
-        }))
-      );
-    } catch (e) {
-      console.warn(
-        `Warning: Failed to get patches from ${remote}: ${e.message}`
-      );
-    }
+  const remoteBranches = branches
+    .split("\n")
+    .map((b) => b.trim())
+    .filter((b) => b.startsWith(`remotes/${PATCHES_REMOTE}/${PACKAGE_NAME}`))
+    .filter((b) => !b.endsWith("-base")) // Filter out base branch
+    .map((b) => b.replace(`remotes/${PATCHES_REMOTE}/`, ""))
+    .map((b) => b.replace(`${PACKAGE_NAME}_`, "")); // Remove package prefix
+
+  if (searchTerm) {
+    return remoteBranches.filter((b) => b.includes(searchTerm));
   }
-
-  // Filter by search term if provided
-  const filteredPatches = searchTerm
-    ? allPatches.filter((p) => p.name.includes(searchTerm))
-    : allPatches;
-
-  return filteredPatches;
+  return remoteBranches;
 }
 
 function getRelativeTime(timestamp) {
@@ -671,18 +576,17 @@ function getRelativeTime(timestamp) {
   return `${seconds}s ago`;
 }
 
-async function getPatchInfo(branchName, remote = PATCHES_REMOTE) {
-  const fullBranchName = `${remote}/${PACKAGE_NAME}_${branchName}`;
+async function getPatchInfo(branchName) {
+  const fullBranchName = `${PATCHES_REMOTE}/${PACKAGE_NAME}_${branchName}`;
   const commitInfo = await execGit(
-    ["log", "-1", "--format=%H|%s|%an|%ar", fullBranchName],
+    ["log", "-1", "--format=%an|%at", fullBranchName],
     `Failed to get commit info for ${branchName}`
   );
 
-  const [hash, subject, author, relativeTime] = commitInfo.split("|");
+  const [author, timestamp] = commitInfo.split("|");
+  const relativeTime = getRelativeTime(parseInt(timestamp) * 1000);
 
   return {
-    hash: hash.substring(0, 7), // Short hash
-    subject: subject.trim(),
     author,
     relativeTime,
   };
@@ -741,7 +645,7 @@ async function publishPatch(branchName) {
 
   // Create single commit with all changes
   await execGit(
-    ["commit", "-m", `${branchName}`],
+    ["commit", "-m", `Patch: ${branchName}`],
     "Failed to create patch commit"
   );
 
@@ -783,28 +687,9 @@ program
       if (patches.length === 0) {
         console.log("  No patches found");
       } else {
-        // Sort patches by timestamp (newest first)
-        const config = await getPatchConfig();
-
         for (const patch of patches) {
-          const { hash, subject, author, relativeTime } = await getPatchInfo(
-            patch.name,
-            patch.remote
-          );
-          const isApplied = config.appliedPatches.includes(
-            `${PACKAGE_NAME}_${patch.name}`
-          );
-          const prefix = isApplied ? "* " : "  ";
-
-          // Pad all columns to align output
-          const nameCol = patch.name.padEnd(30);
-          const hashCol = hash.padEnd(8);
-          const subjectCol = subject.padEnd(40);
-          const authorCol = author.padEnd(20);
-
-          console.log(
-            `${prefix}${nameCol} - ${hashCol} - ${subjectCol} - ${author} (${relativeTime})`
-          );
+          const { author, relativeTime } = await getPatchInfo(patch);
+          console.log(`  - ${patch} (by ${author}, ${relativeTime})`);
         }
       }
     } catch (e) {
