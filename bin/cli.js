@@ -178,24 +178,53 @@ async function ensurePatchBranch() {
   await savePatchConfig(config);
 }
 
-// Patch operations
 async function handlePackageChanges() {
+  // Check if there's a merge conflict in package-lock.json
+  const hasLockConflict = await execGit(
+    ["diff", "--name-only", "--diff-filter=U"],
+    "Failed to check conflicts"
+  ).then((output) =>
+    output.split("\n").some((file) => file === "package-lock.json")
+  );
+
+  if (hasLockConflict) {
+    // If there's a conflict in package-lock.json, remove it
+    await fs.unlink("package-lock.json").catch(() => {
+      // Ignore if file doesn't exist
+    });
+
+    // Regenerate package-lock.json without modifying node_modules
+    try {
+      await execa("npm", ["install", "--package-lock-only"]);
+
+      // Stage the regenerated package-lock.json
+      await execGit(
+        ["add", "package-lock.json"],
+        "Failed to stage regenerated package-lock.json"
+      );
+
+      return true; // Indicate that we handled a package-lock conflict
+    } catch (e) {
+      throw new Error(`Failed to regenerate package-lock.json: ${e.message}`);
+    }
+  }
+
+  // If no package-lock conflict, check if we still need to run regular npm install
   const packageLockExists = await fs
     .access("package-lock.json")
     .then(() => true)
     .catch(() => false);
 
-  if (packageLockExists) {
-    await fs.unlink("package-lock.json");
+  if (!packageLockExists) {
+    try {
+      await execa("npm", ["install"]);
+    } catch (e) {
+      throw new Error(`Failed to run npm install: ${e.message}`);
+    }
   }
 
-  try {
-    await execa("npm", ["install"]);
-  } catch (e) {
-    throw new Error(`Failed to run npm install: ${e.message}`);
-  }
+  return false; // Indicate no package-lock conflict was handled
 }
-
 async function applyPatch(patchName) {
   const config = await getPatchConfig();
   const initialState = await saveGitState();
@@ -228,8 +257,23 @@ async function applyPatch(patchName) {
         "Failed to cherry-pick commit"
       );
 
-      // Handle package-lock.json and npm install
-      await handlePackageChanges();
+      // Handle potential package-lock.json conflicts
+      const handledLockConflict = await handlePackageChanges();
+
+      // If we didn't handle a package-lock conflict but there are still conflicts,
+      // we need to throw an error
+      if (!handledLockConflict) {
+        const hasOtherConflicts = await execGit(
+          ["diff", "--name-only", "--diff-filter=U"],
+          "Failed to check conflicts"
+        );
+
+        if (hasOtherConflicts) {
+          throw new Error(
+            "Merge conflicts detected in files other than package-lock.json"
+          );
+        }
+      }
 
       // Stage and commit all changes
       await execGit(["add", "."], "Failed to stage changes");
