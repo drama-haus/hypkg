@@ -278,7 +278,7 @@ program
       const baseBranch = await syncBranches();
       await ensurePatchBranch(baseBranch);
 
-      // await execa('npm', ['install']);
+      await execa('npm', ['install']);
       createLocalBinLink();
       console.log("Patch management system installed successfully!");
       await listPatches();

@@ -11,8 +11,8 @@
   "author": "itspeezy",
   "license": "GPL-3.0-only",
   "dependencies": {
-    "execa": "^5.1.1",
-    "commander": "^11.0.0"
+    "commander": "^11.0.0",
+    "execa": "^5.1.1"
   },
   "config": {
     "patchesRepo": "https://github.com/drama-haus/hyperfy.git",
