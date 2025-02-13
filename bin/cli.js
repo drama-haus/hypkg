@@ -481,4 +481,133 @@ program
     }
   });
 
+async function searchPatches(searchTerm = "") {
+  const branches = await execGit(
+    ["branch", "-a"],
+    "Failed to list all branches"
+  );
+
+  const remoteBranches = branches
+    .split("\n")
+    .map((b) => b.trim())
+    .filter((b) => b.startsWith(`remotes/${PATCHES_REMOTE}/${PACKAGE_NAME}`))
+    .map((b) => b.replace(`remotes/${PATCHES_REMOTE}/`, ""));
+
+  if (searchTerm) {
+    return remoteBranches.filter((b) => b.includes(searchTerm));
+  }
+  return remoteBranches;
+}
+
+async function getBranchDiff(branchName) {
+  const baseBranch = await getBaseBranch();
+  return execGit(
+    ["diff", `${baseBranch}...${branchName}`, "--name-only"],
+    "Failed to get branch diff"
+  );
+}
+
+async function publishPatch(branchName) {
+  // Verify we're on the correct branch
+  const currentBranch = await getCurrentBranch();
+  if (currentBranch !== branchName) {
+    throw new Error(
+      `Not on branch ${branchName}. Please checkout the branch first.`
+    );
+  }
+
+  const patchBranchName = `${PACKAGE_NAME}_${branchName}`;
+
+  // Check if patch branch already exists
+  const existingBranches = await searchPatches();
+  if (existingBranches.includes(patchBranchName)) {
+    // Compare diffs
+    const existingDiff = await getBranchDiff(
+      `${PATCHES_REMOTE}/${patchBranchName}`
+    );
+    const currentDiff = await getBranchDiff(branchName);
+
+    if (existingDiff === currentDiff) {
+      console.log(
+        `Patch ${patchBranchName} already exists with the same changes.`
+      );
+      return;
+    }
+
+    throw new Error(
+      `Patch ${patchBranchName} already exists with different changes.`
+    );
+  }
+
+  // Create new branch for the patch
+  await execGit(
+    ["checkout", "-b", patchBranchName],
+    "Failed to create patch branch"
+  );
+
+  // Get the base branch commit
+  const baseBranch = await getBaseBranch();
+  const baseCommit = await execGit(
+    ["merge-base", baseBranch, branchName],
+    "Failed to find merge base"
+  );
+
+  // Squash all commits since the base branch
+  await execGit(
+    ["reset", "--soft", baseCommit],
+    "Failed to reset to base commit"
+  );
+
+  // Create single commit with all changes
+  await execGit(
+    ["commit", "-m", `Patch: ${branchName}`],
+    "Failed to create patch commit"
+  );
+
+  // Push to remote
+  await execGit(
+    ["push", "-u", PATCHES_REMOTE, patchBranchName],
+    "Failed to push patch branch"
+  );
+
+  // Return to original branch
+  await execGit(
+    ["checkout", branchName],
+    "Failed to return to development branch"
+  );
+
+  console.log(`Successfully published patch: ${patchBranchName}`);
+}
+
+// Add new commands to the CLI
+program
+  .command("publish <branchName>")
+  .description("Publish current branch as a patch")
+  .action(async (branchName) => {
+    try {
+      await publishPatch(branchName);
+    } catch (e) {
+      console.error(`Failed to publish patch: ${e.message}`);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("search [patchName]")
+  .description("Search for patches (lists all if no name provided)")
+  .action(async (patchName) => {
+    try {
+      const patches = await searchPatches(patchName);
+      console.log("\nAvailable patches:");
+      if (patches.length === 0) {
+        console.log("  No patches found");
+      } else {
+        patches.forEach((patch) => console.log(`  - ${patch}`));
+      }
+    } catch (e) {
+      console.error(`Failed to search patches: ${e.message}`);
+      process.exit(1);
+    }
+  });
+
 program.parse();
