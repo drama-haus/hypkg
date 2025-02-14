@@ -2,6 +2,7 @@
 
 const { program } = require("commander");
 const execa = require("execa");
+const inquirer = require("inquirer");
 const path = require("path");
 const fs = require("fs").promises;
 
@@ -443,11 +444,177 @@ async function resetPatches() {
   await listPatches();
 }
 
-// CLI commands setup
+let PROJECT_PATH;
+// Interactive setup functions
+async function promptForNewProject() {
+  const { projectName } = await inquirer.prompt([
+    {
+      type: "input",
+      name: "projectName",
+      message: "What is your project name?",
+      default: path.basename(process.cwd()),
+      validate: (input) => input.trim().length > 0,
+    },
+  ]);
+
+  const projectPath = path.join(process.cwd(), projectName);
+
+  // Create project directory
+  await fs.mkdir(projectPath, { recursive: true });
+  process.chdir(projectPath);
+  PROJECT_PATH = projectPath;
+
+  // Initialize git repo
+  await execGit(["init"], "Failed to initialize git repository");
+  await execGit(
+    ["remote", "add", "origin", TARGET_REPO],
+    "Failed to add origin remote"
+  );
+
+  return projectPath;
+}
+
+async function promptForBranch() {
+  const currentBranch = await getCurrentBranch();
+  const branches = await execGit(["branch", "-a"], "Failed to list branches");
+  const availableBranches = branches
+    .split("\n")
+    .map((b) => b.trim().replace("* ", ""))
+    .filter((b) => !b.startsWith("remotes/"));
+
+  const { branch } = await inquirer.prompt([
+    {
+      type: "list",
+      name: "branch",
+      message: "Which branch would you like to use?",
+      default: currentBranch,
+      choices: availableBranches,
+    },
+  ]);
+
+  return branch;
+}
+
+async function promptForPatches() {
+  const patches = await searchPatches();
+  if (patches.length === 0) {
+    console.log("No patches available to apply.");
+    return [];
+  }
+
+  const patchChoices = await Promise.all(
+    patches.map(async (patch) => {
+      const { author, relativeTime } = await getPatchInfo(patch);
+      return {
+        name: `${patch} (by ${author}, ${relativeTime})`,
+        value: patch,
+      };
+    })
+  );
+
+  const { selectedPatches } = await inquirer.prompt([
+    {
+      type: "checkbox",
+      name: "selectedPatches",
+      message: "Select patches to apply:",
+      choices: patchChoices,
+      pageSize: 10,
+    },
+  ]);
+
+  return selectedPatches;
+}
+
+// Modified install function with interactive setup
+async function interactiveInstall() {
+  try {
+    let projectPath = process.cwd();
+
+    // Check if we're in a git repository
+    const isGitRepo = await fs
+      .access(".git")
+      .then(() => true)
+      .catch(() => false);
+
+    if (!isGitRepo) {
+      console.log("No git repository detected. Setting up a new project...");
+      projectPath = await promptForNewProject();
+    }
+
+    // Verify repository or set it up
+    try {
+      await verifyRepo();
+    } catch (e) {
+      console.log("Repository not configured. Setting up...");
+      await execGit(
+        ["remote", "add", "origin", TARGET_REPO],
+        "Failed to add origin remote"
+      );
+    }
+
+    // Sync and select branch
+    await syncBranches();
+    const selectedBranch = await promptForBranch();
+    await execGit(
+      ["checkout", selectedBranch],
+      "Failed to checkout selected branch"
+    );
+
+    // Setup patch management
+    await ensurePatchBranch();
+    await execa("npm", ["install"]);
+    await ensureGlobalLink();
+
+    // Select and apply patches
+    const selectedPatches = await promptForPatches();
+    if (selectedPatches.length > 0) {
+      for (const patch of selectedPatches) {
+        await applyPatch(`${PACKAGE_NAME}_${patch}`);
+      }
+    }
+
+    console.log("\nProject setup completed successfully!");
+    await listPatches();
+
+    process.chdir(PROJECT_PATH);
+    await execa("npm", ["install"]);
+    await execa("cp", [".env.example", ".env"])
+
+    // Add helpful messaging before starting the dev server
+    console.log("\n🎮 Your hyperfy local world is ready!");
+    console.log("Here's what you need to know:");
+    console.log("- Use 'npm run dev' to start the development server");
+    console.log(`- Run '${PACKAGE_NAME} list' to see your applied patches`);
+    console.log(`- Run '${PACKAGE_NAME} search' to browse available patches`);
+    console.log(`- Run '${PACKAGE_NAME} patch <name>' to apply a new patch`);
+    console.log("\nStarting development server...\n");
+
+    // Start the development server
+    try {
+      await execa("npm", ["run", "dev"], {
+        stdio: "inherit", // This will pipe the dev server output to the console
+      });
+    } catch (e) {
+      if (e.exitCode === 130) {
+        // SIGINT (Ctrl+C) was pressed, exit normally
+        process.exit(0);
+      }
+      throw new Error(`Failed to start development server: ${e.message}`);
+    }
+  } catch (e) {
+    console.error(`Setup failed: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+// Modified program setup
 program
   .name(PACKAGE_NAME)
   .description("Patch management system for game engine")
-  .version(packageJson.version);
+  .version(packageJson.version)
+  .action(interactiveInstall); // Default action when no command is provided
+
+// Rest of the existing commands and functions remain the same...
 
 program
   .command("install")

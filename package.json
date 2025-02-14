@@ -12,7 +12,8 @@
   "license": "GPL-3.0-only",
   "dependencies": {
     "commander": "^11.0.0",
-    "execa": "^5.1.1"
+    "execa": "^5.1.1",
+    "inquirer": "^8.2.6"
   },
   "config": {
     "patchesRepo": "https://github.com/drama-haus/hyperfy.git",
