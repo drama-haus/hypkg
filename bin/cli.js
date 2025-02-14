@@ -1,8 +1,12 @@
 #!/usr/bin/env node
 
+const DEBUG = false;
+
 const { program } = require("commander");
 const execa = require("execa");
 const inquirer = require("inquirer");
+const ora = require("ora"); // For spinner animations
+const chalk = require("chalk"); // For colored output
 const path = require("path");
 const fs = require("fs").promises;
 
@@ -11,7 +15,34 @@ const PATCHES_REPO = packageJson.config.patchesRepo;
 const PATCHES_REMOTE = packageJson.config.patchesRemoteName;
 const TARGET_REPO = packageJson.config.targetRepo;
 const PACKAGE_NAME = packageJson.name;
-const BRANCH_NAME = PACKAGE_NAME;
+let BRANCH_NAME = PACKAGE_NAME;
+
+// Utility function for consistent logging
+function log(message, type = "info") {
+  const prefix = {
+    info: chalk.blue("ℹ"),
+    success: chalk.green("✓"),
+    warning: chalk.yellow("⚠"),
+    error: chalk.red("✖"),
+    step: chalk.cyan("→"),
+  }[type];
+
+  console.log(`${prefix} ${message}`);
+}
+
+// Modified function to get the project name and branch name
+async function getProjectName() {
+  // If we're in a git repo, use the directory name
+  const isGitRepo = await fs
+    .access(".git")
+    .then(() => true)
+    .catch(() => false);
+
+  if (isGitRepo) {
+    return path.basename(process.cwd());
+  }
+  return null;
+}
 
 // Git state management
 async function saveGitState() {
@@ -75,10 +106,17 @@ async function restoreGitState(state) {
 
 // Git utilities
 async function execGit(args, errorMessage) {
+  const command = `git ${args.join(" ")}`;
+  if (DEBUG) log(`${command}`, "step");
+
   try {
     const result = await execa("git", args);
+    if (result.stdout.trim() && DEBUG) {
+      log(`Output: ${result.stdout.trim()}`, "info");
+    }
     return result.stdout.trim();
   } catch (e) {
+    log(`${errorMessage}: ${e.message}`, "error");
     throw new Error(`${errorMessage}: ${e.message}`);
   }
 }
@@ -95,19 +133,27 @@ async function getBaseBranch() {
 
 // Config management
 async function getPatchConfig() {
-  const configPath = path.join(process.cwd(), "." + PACKAGE_NAME);
+  const projectName = await getProjectName();
+  const configPath = path.join(
+    process.cwd(),
+    `.${projectName || PACKAGE_NAME}`
+  );
   try {
     return JSON.parse(await fs.readFile(configPath, "utf8"));
   } catch (e) {
     return {
-      branch: BRANCH_NAME,
+      branch: projectName || BRANCH_NAME,
       appliedPatches: [],
     };
   }
 }
 
 async function savePatchConfig(config) {
-  const configPath = path.join(process.cwd(), "." + PACKAGE_NAME);
+  const projectName = await getProjectName();
+  const configPath = path.join(
+    process.cwd(),
+    `.${projectName || PACKAGE_NAME}`
+  );
   await fs.writeFile(configPath, JSON.stringify(config, null, 2));
 }
 
@@ -137,12 +183,21 @@ async function setupPatchesRemote() {
 
 // Branch management
 async function syncBranches() {
-  await execGit(["fetch", "origin"], "Failed to fetch origin");
-  const baseBranch = await getBaseBranch();
-  console.log(`Using ${baseBranch} as base branch`);
-  await execGit(["checkout", baseBranch], "Failed to checkout base branch");
-  await execGit(["pull", "origin", baseBranch], "Failed to pull base branch");
-  return baseBranch;
+  const spinner = ora("Syncing branches...").start();
+
+  try {
+    await execGit(["fetch", "origin"], "Failed to fetch origin");
+    const baseBranch = await getBaseBranch();
+    spinner.text = `Using ${baseBranch} as base branch`;
+    await execGit(["checkout", baseBranch], "Failed to checkout base branch");
+    await execGit(["pull", "origin", baseBranch], "Failed to pull base branch");
+
+    spinner.succeed(`Successfully synced with ${baseBranch}`);
+    return baseBranch;
+  } catch (error) {
+    spinner.fail("Failed to sync branches");
+    throw error;
+  }
 }
 
 async function ensurePatchBranch() {
@@ -154,115 +209,144 @@ async function ensurePatchBranch() {
     .includes(BRANCH_NAME);
 
   if (!branchExists) {
+    // Create a new branch from the current HEAD
+    const baseBranch = await getBaseBranch();
     await execGit(
-      [
-        "branch",
-        "--track",
-        PACKAGE_NAME,
-        `${PATCHES_REMOTE}/${PACKAGE_NAME}-base`,
-      ],
+      ["checkout", "-b", BRANCH_NAME, baseBranch],
       "Failed to create patch branch"
     );
+  } else {
+    await execGit(["checkout", BRANCH_NAME], "Failed to checkout patch branch");
   }
 
-  await execGit(["checkout", BRANCH_NAME], "Failed to checkout patch branch");
-  await execGit(
-    ["branch", `--set-upstream-to=${PATCHES_REMOTE}/${PACKAGE_NAME}-base`],
-    "Failed to set upstream"
-  );
-  await execGit(
-    ["branch", PACKAGE_NAME, "--unset-upstream"],
-    "Failed to unset upstream"
-  );
+  // Try to set upstream, but don't fail if it doesn't exist
+  try {
+    await execGit(
+      ["branch", `--set-upstream-to=${PATCHES_REMOTE}/${PACKAGE_NAME}-base`],
+      "Failed to set upstream"
+    );
+  } catch (e) {
+    // If the remote branch doesn't exist, that's okay
+    log("No remote base branch found, creating new local branch", "info");
+  }
 
   const config = await getPatchConfig();
   await savePatchConfig(config);
 }
 
 async function handlePackageChanges() {
-  // Check if there's a merge conflict in package-lock.json
-  const hasLockConflict = await execGit(
-    ["diff", "--name-only", "--diff-filter=U"],
-    "Failed to check conflicts"
-  ).then((output) =>
-    output.split("\n").some((file) => file === "package-lock.json")
-  );
+  const spinner = ora("Checking package dependencies...").start();
 
-  if (hasLockConflict) {
-    // If there's a conflict in package-lock.json, remove it
-    await fs.unlink("package-lock.json").catch(() => {
-      // Ignore if file doesn't exist
-    });
+  try {
+    // Check for package-lock.json conflicts
+    const hasLockConflict = await execGit(
+      ["diff", "--name-only", "--diff-filter=U"],
+      "Failed to check conflicts"
+    ).then((output) =>
+      output.split("\n").some((file) => file === "package-lock.json")
+    );
 
-    // Regenerate package-lock.json without modifying node_modules
-    try {
-      await execa("npm", ["install", "--package-lock-only"]);
+    if (hasLockConflict) {
+      spinner.text = "Resolving package-lock.json conflicts...";
 
-      // Stage the regenerated package-lock.json
+      // Remove conflicted package-lock.json
+      await fs.unlink("package-lock.json").catch(() => {
+        log("No existing package-lock.json found", "info");
+      });
+
+      // Regenerate package-lock.json
+      spinner.text = "Regenerating package-lock.json...";
+      try {
+        const npmResult = await execa(
+          "npm",
+          ["install", "--package-lock-only"],
+          {
+            stdio: ["pipe", "pipe", "pipe"],
+          }
+        );
+        log(npmResult.stdout, "info");
+      } catch (e) {
+        spinner.fail("Failed to regenerate package-lock.json");
+        throw e;
+      }
+
+      // Stage regenerated package-lock.json
       await execGit(
         ["add", "package-lock.json"],
         "Failed to stage regenerated package-lock.json"
       );
 
-      return true; // Indicate that we handled a package-lock conflict
-    } catch (e) {
-      throw new Error(`Failed to regenerate package-lock.json: ${e.message}`);
+      spinner.succeed("Package lock file regenerated successfully");
+      return true;
     }
-  }
 
-  // If no package-lock conflict, check if we still need to run regular npm install
-  const packageLockExists = await fs
-    .access("package-lock.json")
-    .then(() => true)
-    .catch(() => false);
+    // Check if we need to run regular npm install
+    const packageLockExists = await fs
+      .access("package-lock.json")
+      .then(() => true)
+      .catch(() => false);
 
-  if (!packageLockExists) {
-    try {
-      await execa("npm", ["install"]);
-    } catch (e) {
-      throw new Error(`Failed to run npm install: ${e.message}`);
+    if (!packageLockExists) {
+      spinner.text = "Installing dependencies...";
+      try {
+        const npmResult = await execa("npm", ["install"], {
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        log(npmResult.stdout, "info");
+      } catch (e) {
+        spinner.fail("Failed to install dependencies");
+        throw e;
+      }
     }
-  }
 
-  return false; // Indicate no package-lock conflict was handled
+    spinner.succeed("Dependencies handled successfully");
+    return false;
+  } catch (error) {
+    spinner.fail("Failed to handle package changes");
+    throw error;
+  }
 }
+
 async function applyPatch(patchName) {
+  const spinner = ora(`Applying patch: ${patchName}`).start();
   const config = await getPatchConfig();
   const initialState = await saveGitState();
 
   if (config.appliedPatches.includes(patchName)) {
-    console.log(`Patch ${patchName} is already applied`);
+    spinner.info(`Patch ${patchName} is already applied`);
     return;
   }
 
   try {
+    spinner.text = "Finding patch commit...";
     const commit = await execGit(
       ["rev-list", "-n", "1", `${PATCHES_REMOTE}/${patchName}`, "^HEAD"],
       `Failed to find commit for patch ${patchName}`
     );
 
     if (!commit) {
+      spinner.fail(`No unique commits found in ${patchName}`);
       throw new Error(`No unique commits found in ${patchName}`);
     }
 
     try {
-      // Try normal cherry-pick first
+      spinner.text = "Applying patch changes...";
       await execGit(["cherry-pick", commit], "Failed to cherry-pick commit");
+      spinner.succeed(
+        `Successfully cherry-picked commit ${commit.slice(0, 7)}`
+      );
     } catch (cherryPickError) {
-      // If it fails, abort and try the package-lock.json handling approach
-      await execGit(["cherry-pick", "--abort"], "Failed to abort cherry-pick");
+      spinner.warn("Cherry-pick failed, attempting alternative approach...");
 
-      // Try cherry-pick without committing
+      await execGit(["cherry-pick", "--abort"], "Failed to abort cherry-pick");
       await execGit(
         ["cherry-pick", "-n", commit],
         "Failed to cherry-pick commit"
       );
 
-      // Handle potential package-lock.json conflicts
+      spinner.text = "Handling package dependencies...";
       const handledLockConflict = await handlePackageChanges();
 
-      // If we didn't handle a package-lock conflict but there are still conflicts,
-      // we need to throw an error
       if (!handledLockConflict) {
         const hasOtherConflicts = await execGit(
           ["diff", "--name-only", "--diff-filter=U"],
@@ -270,13 +354,14 @@ async function applyPatch(patchName) {
         );
 
         if (hasOtherConflicts) {
+          spinner.fail("Merge conflicts detected");
           throw new Error(
             "Merge conflicts detected in files other than package-lock.json"
           );
         }
       }
 
-      // Stage and commit all changes
+      spinner.text = "Committing changes...";
       await execGit(["add", "."], "Failed to stage changes");
       await execGit(
         ["commit", "-m", `Applied patch: ${patchName}`],
@@ -284,15 +369,14 @@ async function applyPatch(patchName) {
       );
     }
 
-    // Update config only after successful patch application
+    // Update config
     config.appliedPatches.push(patchName);
     await savePatchConfig(config);
 
-    console.log(`Successfully applied patch: ${patchName}`);
+    spinner.succeed(`Successfully applied patch: ${patchName}`);
   } catch (error) {
-    console.error(
-      `Error while applying patch, rolling back to initial state...`
-    );
+    spinner.fail(`Failed to apply patch: ${error.message}`);
+    log("Rolling back to initial state...", "warning");
     await restoreGitState(initialState);
     throw error;
   }
@@ -456,21 +540,18 @@ async function promptForNewProject() {
       validate: (input) => input.trim().length > 0,
     },
   ]);
-
   const projectPath = path.join(process.cwd(), projectName);
 
   // Create project directory
   await fs.mkdir(projectPath, { recursive: true });
   process.chdir(projectPath);
   PROJECT_PATH = projectPath;
-
   // Initialize git repo
   await execGit(["init"], "Failed to initialize git repository");
   await execGit(
     ["remote", "add", "origin", TARGET_REPO],
     "Failed to add origin remote"
   );
-
   return projectPath;
 }
 
@@ -528,81 +609,136 @@ async function promptForPatches() {
 // Modified install function with interactive setup
 async function interactiveInstall() {
   try {
-    let projectPath = process.cwd();
-
-    // Check if we're in a git repository
+    // Check if we're in a git repository - no spinner needed for this quick check
     const isGitRepo = await fs
       .access(".git")
       .then(() => true)
       .catch(() => false);
 
-    if (!isGitRepo) {
-      console.log("No git repository detected. Setting up a new project...");
-      projectPath = await promptForNewProject();
+    if (isGitRepo) {
+      const spinner = ora("Checking repository...").start();
+      try {
+        await verifyRepo();
+        spinner.succeed("Found existing repository");
+        // If we're in the correct repo, just run list command
+        await listPatches();
+        return;
+      } catch (e) {
+        spinner.fail("Not in the correct repository");
+        console.log(
+          "Please run this command in a new directory to set up a new project."
+        );
+        process.exit(1);
+      }
     }
 
-    // Verify repository or set it up
+    // Stop any existing spinner before user input
+    log("Setting up a new project...", "info");
+
+    // Get project name and set up new repository - no spinner during user input
+    const projectPath = await promptForNewProject();
+
+    const projectName = path.basename(projectPath);
+    BRANCH_NAME = projectName; // Use project name for the branch instead of package name
+
+    // Now we can start using spinners again for operations
+    let spinner = ora("Setting up repository...").start();
+
     try {
       await verifyRepo();
+      spinner.succeed("Repository configured");
     } catch (e) {
-      console.log("Repository not configured. Setting up...");
+      // Configuration failed, but we'll set it up
+      spinner.text = "Configuring repository...";
       await execGit(
         ["remote", "add", "origin", TARGET_REPO],
         "Failed to add origin remote"
       );
+      spinner.succeed("Repository configured");
     }
 
-    // Sync and select branch
+    // Sync branches
+    spinner.text = "Syncing branches...";
     await syncBranches();
+    spinner.succeed("Branches synced");
+
+    // Stop spinner for branch selection
+    spinner.stop();
     const selectedBranch = await promptForBranch();
+
+    // Resume spinner for next operations
+    spinner.start("Checking out selected branch...");
     await execGit(
       ["checkout", selectedBranch],
       "Failed to checkout selected branch"
     );
+    spinner.succeed("Branch checked out");
 
     // Setup patch management
+    spinner.start("Setting up patch management...");
     await ensurePatchBranch();
-    await execa("npm", ["install"]);
-    await ensureGlobalLink();
+    spinner.succeed("Patch management configured");
 
-    // Select and apply patches
+    spinner.start("Installing dependencies...");
+    const npmInstall = await execa("npm", ["install"], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    log(npmInstall.stdout, "info");
+    spinner.succeed("Dependencies installed");
+
+    spinner.start("Creating global command link...");
+    await ensureGlobalLink();
+    spinner.succeed("Command link created");
+
+    // Stop spinner for patch selection
+    spinner.stop();
     const selectedPatches = await promptForPatches();
+
     if (selectedPatches.length > 0) {
       for (const patch of selectedPatches) {
         await applyPatch(`${PACKAGE_NAME}_${patch}`);
       }
     }
 
-    console.log("\nProject setup completed successfully!");
+    // Copy environment file
+    spinner.start("Setting up environment...");
+    try {
+      await execa("cp", [".env.example", ".env"]);
+      spinner.succeed("Environment configured");
+    } catch (e) {
+      spinner.info("No .env.example file found, skipping environment setup");
+    }
+
+    // Display final information
+    log("\n🎮 Your game engine project is ready!", "success");
+    log("Here's what you need to know:", "info");
+    console.log(
+      chalk.cyan(`
+    Commands available:
+    → npm run dev         - Start the development server
+    → ${PACKAGE_NAME} list    - See your applied patches
+    → ${PACKAGE_NAME} search  - Browse available patches
+    → ${PACKAGE_NAME} patch   - Apply a new patch
+    `)
+    );
+
     await listPatches();
 
-    process.chdir(PROJECT_PATH);
-    await execa("npm", ["install"]);
-    await execa("cp", [".env.example", ".env"])
-
-    // Add helpful messaging before starting the dev server
-    console.log("\n🎮 Your hyperfy local world is ready!");
-    console.log("Here's what you need to know:");
-    console.log("- Use 'npm run dev' to start the development server");
-    console.log(`- Run '${PACKAGE_NAME} list' to see your applied patches`);
-    console.log(`- Run '${PACKAGE_NAME} search' to browse available patches`);
-    console.log(`- Run '${PACKAGE_NAME} patch <name>' to apply a new patch`);
-    console.log("\nStarting development server...\n");
+    log("\nStarting development server...", "step");
 
     // Start the development server
     try {
       await execa("npm", ["run", "dev"], {
-        stdio: "inherit", // This will pipe the dev server output to the console
+        stdio: "inherit",
       });
     } catch (e) {
       if (e.exitCode === 130) {
-        // SIGINT (Ctrl+C) was pressed, exit normally
         process.exit(0);
       }
       throw new Error(`Failed to start development server: ${e.message}`);
     }
   } catch (e) {
-    console.error(`Setup failed: ${e.message}`);
+    console.error(chalk.red(`Setup failed: ${e.message}`));
     process.exit(1);
   }
 }
@@ -800,7 +936,7 @@ async function publishPatch(branchName) {
   // Get the base branch commit
   const baseBranch = await getBaseBranch();
   const baseCommit = await execGit(
-    ["merge-base", `${BRANCH_NAME}-base`, branchName],
+    ["merge-base", `${PACKAGE_NAME}-base`, branchName],
     "Failed to find merge base"
   );
 
