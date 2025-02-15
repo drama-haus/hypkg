@@ -157,6 +157,27 @@ async function savePatchConfig(config) {
   await fs.writeFile(configPath, JSON.stringify(config, null, 2));
 }
 
+async function getAppliedPatches() {
+  const baseBranch = await getBaseBranch();
+  try {
+    const commits = await execGit(
+      ["log", `${baseBranch}..HEAD`, "--grep=^cow_", "--format=%s"],
+      "Failed to get patch commits"
+    );
+
+    return commits
+      .split("\n")
+      .filter(Boolean)
+      .map((commit) => {
+        const match = commit.match(/^cow_(.+)$/);
+        return match ? match[1] : null;
+      })
+      .filter(Boolean);
+  } catch (e) {
+    return [];
+  }
+}
+
 // Repository management
 async function verifyRepo() {
   const origin = await execGit(
@@ -309,13 +330,14 @@ async function handlePackageChanges() {
 
 async function applyPatch(patchName) {
   const spinner = ora(`Applying patch: ${patchName}`).start();
-  const config = await getPatchConfig();
-  const initialState = await saveGitState();
+  const appliedPatches = await getAppliedPatches();
 
-  if (config.appliedPatches.includes(patchName)) {
+  if (appliedPatches.includes(patchName)) {
     spinner.info(`Patch ${patchName} is already applied`);
     return;
   }
+
+  const initialState = await saveGitState();
 
   try {
     spinner.text = "Finding patch commit...";
@@ -332,9 +354,14 @@ async function applyPatch(patchName) {
     try {
       spinner.text = "Applying patch changes...";
       await execGit(["cherry-pick", commit], "Failed to cherry-pick commit");
-      spinner.succeed(
-        `Successfully cherry-picked commit ${commit.slice(0, 7)}`
+
+      // Update commit message to track patch
+      await execGit(
+        ["commit", "--amend", "-m", `${patchName}`],
+        "Failed to update commit message"
       );
+
+      spinner.succeed(`Successfully applied patch: ${patchName}`);
     } catch (cherryPickError) {
       spinner.warn("Cherry-pick failed, attempting alternative approach...");
 
@@ -364,16 +391,10 @@ async function applyPatch(patchName) {
       spinner.text = "Committing changes...";
       await execGit(["add", "."], "Failed to stage changes");
       await execGit(
-        ["commit", "-m", `Applied patch: ${patchName}`],
+        ["commit", "-m", `cow_${patchName}`],
         "Failed to commit changes"
       );
     }
-
-    // Update config
-    config.appliedPatches.push(patchName);
-    await savePatchConfig(config);
-
-    spinner.succeed(`Successfully applied patch: ${patchName}`);
   } catch (error) {
     spinner.fail(`Failed to apply patch: ${error.message}`);
     log("Rolling back to initial state...", "warning");
@@ -383,40 +404,54 @@ async function applyPatch(patchName) {
 }
 
 async function removePatch(patchName) {
-  const config = await getPatchConfig();
-  const initialState = await saveGitState();
-
-  if (!config.appliedPatches.includes(patchName)) {
-    console.log(`Patch ${patchName} is not applied`);
+  const spinner = ora(`Removing patch: ${patchName}`).start();
+  const appliedPatches = await getAppliedPatches();
+  if (!appliedPatches.includes(patchName)) {
+    spinner.info(`Patch ${patchName} is not applied`);
     return;
   }
 
+  const initialState = await saveGitState();
+
   try {
     const baseBranch = await getBaseBranch();
-    const tempBranch = `temp-${Date.now()}`;
 
+    // Find the commit that applied this patch
+    const patchCommit = await execGit(
+      ["log", "--grep", `^${patchName}$`, "--format=%H"],
+      "Failed to find patch commit"
+    );
+
+    if (!patchCommit) {
+      throw new Error(`Could not find commit for patch ${patchName}`);
+    }
+
+    // Create temporary branch
+    const tempBranch = `temp-${Date.now()}`;
     await execGit(["branch", tempBranch], "Failed to create temp branch");
+
+    // Reset to base branch
     await execGit(
       ["reset", "--hard", baseBranch],
       "Failed to reset to base branch"
     );
 
+    // Get all commits except the patch to remove
     const commits = await execGit(
       ["log", `${baseBranch}..${tempBranch}`, "--format=%H %s"],
       "Failed to get commit list"
     );
 
-    const commitList = commits.split("\n").reverse().filter(Boolean);
-
-    for (const commit of commitList) {
-      const [hash, ...messageParts] = commit.split(" ");
+    // Apply all commits except the patch commit
+    for (const commitLine of commits.split("\n").reverse()) {
+      if (!commitLine) continue;
+      const [hash, ...messageParts] = commitLine.split(" ");
       const message = messageParts.join(" ");
 
-      if (!message.includes(`Applied patch: ${patchName}`)) {
+      if (hash !== patchCommit) {
         try {
           await execGit(["cherry-pick", hash], "Failed to cherry-pick commit");
         } catch (e) {
-          // If cherry-pick fails, try the package-lock.json handling approach
           await execGit(
             ["cherry-pick", "--abort"],
             "Failed to abort cherry-pick"
@@ -432,41 +467,35 @@ async function removePatch(patchName) {
       }
     }
 
+    // Clean up temporary branch
     await execGit(["branch", "-D", tempBranch], "Failed to delete temp branch");
 
-    // Update package dependencies after all patches are reapplied
+    // Update dependencies
     await handlePackageChanges();
 
-    config.appliedPatches = config.appliedPatches.filter(
-      (p) => p !== patchName
-    );
-    await savePatchConfig(config);
-
-    console.log(`Successfully removed patch: ${patchName}`);
+    spinner.succeed(`Successfully removed patch: ${patchName}`);
   } catch (error) {
-    console.error(
-      `Error while removing patch, rolling back to initial state...`
-    );
+    spinner.fail(`Failed to remove patch: ${error.message}`);
+    log("Rolling back to initial state...", "warning");
     await restoreGitState(initialState);
     throw error;
   }
 }
 
 async function listPatches() {
-  const config = await getPatchConfig();
+  const appliedPatches = await getAppliedPatches();
 
   console.log("\nCurrently applied patches:");
-  if (config.appliedPatches.length === 0) {
+  if (appliedPatches.length === 0) {
     console.log("  No patches applied");
   } else {
-    for (const patch of config.appliedPatches) {
-      const displayName = patch.replace(`${PACKAGE_NAME}_`, "");
+    for (const patch of appliedPatches) {
+      const displayName = patch.replace(`cow_`, "");
       const { author, relativeTime } = await getPatchInfo(displayName);
       console.log(`  - ${displayName} (by ${author}, ${relativeTime})`);
     }
   }
 }
-
 // Installation management
 async function ensureGlobalLink() {
   try {
@@ -696,7 +725,7 @@ async function interactiveInstall() {
 
     if (selectedPatches.length > 0) {
       for (const patch of selectedPatches) {
-        await applyPatch(`${PACKAGE_NAME}_${patch}`);
+        await applyPatch(`cow_${patch}`);
       }
     }
 
@@ -776,9 +805,9 @@ program
   .action(async (patchName) => {
     try {
       // Remove package prefix if it's already there
-      const cleanPatchName = patchName.startsWith(`${PACKAGE_NAME}_`)
+      const cleanPatchName = patchName.startsWith(`cow_`)
         ? patchName
-        : `${PACKAGE_NAME}_${patchName}`;
+        : `cow_${patchName}`;
       await applyPatch(cleanPatchName);
       await listPatches();
     } catch (e) {
@@ -792,10 +821,7 @@ program
   .description("Remove a specific patch")
   .action(async (patchName) => {
     try {
-      // Remove package prefix if it's already there
-      const cleanPatchName = patchName.startsWith(`${PACKAGE_NAME}_`)
-        ? patchName
-        : `${PACKAGE_NAME}_${patchName}`;
+      const cleanPatchName = patchName.replace(/^cow_/, '');
       await removePatch(cleanPatchName);
       await listPatches();
     } catch (e) {
@@ -841,7 +867,7 @@ program
   });
 
 async function searchPatches(searchTerm = "") {
-  await execGit(["remote", "update", PATCHES_REMOTE, "--prune"])
+  await execGit(["remote", "update", PATCHES_REMOTE, "--prune"]);
 
   const branches = await execGit(
     ["branch", "-a"],
@@ -851,11 +877,12 @@ async function searchPatches(searchTerm = "") {
   const remoteBranches = branches
     .split("\n")
     .map((b) => b.trim())
-    .filter((b) => b.startsWith(`remotes/${PATCHES_REMOTE}/${PACKAGE_NAME}`))
+    .filter((b) => b.startsWith(`remotes/${PATCHES_REMOTE}/cow_`))
     .filter((b) => !b.endsWith("-base")) // Filter out base branch
     .map((b) => b.replace(`remotes/${PATCHES_REMOTE}/`, ""))
-    .map((b) => b.replace(`${PACKAGE_NAME}_`, "")); // Remove package prefix
+    .map((b) => b.replace(`cow_`, "")); // Remove package prefix
 
+  console.log(remoteBranches)
   if (searchTerm) {
     return remoteBranches.filter((b) => b.includes(searchTerm));
   }
@@ -882,7 +909,7 @@ function getRelativeTime(timestamp) {
 }
 
 async function getPatchInfo(branchName) {
-  const fullBranchName = `${PATCHES_REMOTE}/${PACKAGE_NAME}_${branchName}`;
+  const fullBranchName = `${PATCHES_REMOTE}/cow_${branchName}`;
   const commitInfo = await execGit(
     ["log", "-1", "--format=%an|%at", fullBranchName],
     `Failed to get commit info for ${branchName}`
@@ -906,7 +933,7 @@ async function publishPatch(branchName) {
     );
   }
 
-  const patchBranchName = `${PACKAGE_NAME}_${branchName}`;
+  const patchBranchName = `cow_${branchName}`;
 
   // Check if patch branch already exists
   const existingBranches = await searchPatches();
@@ -1093,7 +1120,7 @@ program
       .argument("<patchName>", "name of the patch to develop")
       .action(async (patchName) => {
         try {
-          const devBranch = `dev_${PACKAGE_NAME}_${patchName}`;
+          const devBranch = `dev_cow_${patchName}`;
           const spinner = ora(
             `Initializing development environment for ${patchName}`
           ).start();
@@ -1150,7 +1177,7 @@ program
       .argument("<patchName>", "name of the patch to update")
       .action(async (patchName) => {
         try {
-          const devBranch = `dev_${PACKAGE_NAME}_${patchName}`;
+          const devBranch = `dev_cow_${patchName}`;
           const spinner = ora(
             `Updating ${patchName} development branch`
           ).start();
@@ -1228,12 +1255,12 @@ program
         try {
           const version = options.version || "1.0.0";
           const spinner = ora(
-            `Preparing release ${version} for ${patchName}`
+            `Preparing release ${version} for ${patchName}\n`
           ).start();
 
           try {
-            const devBranch = `dev_${PACKAGE_NAME}_${patchName}`;
-            const releaseBranch = `${PACKAGE_NAME}_${patchName}`;
+            const devBranch = `dev_cow_${patchName}`;
+            const releaseBranch = `cow_${patchName}`;
             const currentBranch = await getCurrentBranch();
 
             // Verify we're on dev branch
@@ -1245,10 +1272,12 @@ program
 
             // Create or checkout release branch from main
             const baseBranch = await getBaseBranch();
-            const branches = await execGit(
-              ["branch"],
-              "Failed to list branches"
-            );
+            const branches = (
+              await execGit(["branch"], "Failed to list branches")
+            )
+              .split("\n")
+              .map((branch) => branch.trim().replace("* ", ""))
+              .filter(Boolean);
 
             if (!branches.includes(releaseBranch)) {
               await execGit(
