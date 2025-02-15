@@ -30,20 +30,6 @@ function log(message, type = "info") {
   console.log(`${prefix} ${message}`);
 }
 
-// Modified function to get the project name and branch name
-async function getProjectName() {
-  // If we're in a git repo, use the directory name
-  const isGitRepo = await fs
-    .access(".git")
-    .then(() => true)
-    .catch(() => false);
-
-  if (isGitRepo) {
-    return path.basename(process.cwd());
-  }
-  return null;
-}
-
 // Git state management
 async function saveGitState() {
   const currentBranch = await getCurrentBranch();
@@ -131,32 +117,6 @@ async function getBaseBranch() {
   return hasDev ? "dev" : "main";
 }
 
-// Config management
-async function getPatchConfig() {
-  const projectName = await getProjectName();
-  const configPath = path.join(
-    process.cwd(),
-    `.${projectName || PACKAGE_NAME}`
-  );
-  try {
-    return JSON.parse(await fs.readFile(configPath, "utf8"));
-  } catch (e) {
-    return {
-      branch: projectName || BRANCH_NAME,
-      appliedPatches: [],
-    };
-  }
-}
-
-async function savePatchConfig(config) {
-  const projectName = await getProjectName();
-  const configPath = path.join(
-    process.cwd(),
-    `.${projectName || PACKAGE_NAME}`
-  );
-  await fs.writeFile(configPath, JSON.stringify(config, null, 2));
-}
-
 async function getAppliedPatches() {
   const baseBranch = await getBaseBranch();
   try {
@@ -221,13 +181,13 @@ async function syncBranches() {
   }
 }
 
-async function ensurePatchBranch() {
+async function ensurePatchBranch(selectedBranch) {
   await setupPatchesRemote();
   const branches = await execGit(["branch"], "Failed to list branches");
   const branchExists = branches
     .split("\n")
     .map((b) => b.trim())
-    .includes(BRANCH_NAME);
+    .includes(selectedBranch);
 
   if (!branchExists) {
     // Create a new branch from the current HEAD
@@ -240,19 +200,18 @@ async function ensurePatchBranch() {
     await execGit(["checkout", BRANCH_NAME], "Failed to checkout patch branch");
   }
 
-  // Try to set upstream, but don't fail if it doesn't exist
-  try {
-    await execGit(
-      ["branch", `--set-upstream-to=${PATCHES_REMOTE}/${PACKAGE_NAME}-base`],
-      "Failed to set upstream"
-    );
-  } catch (e) {
-    // If the remote branch doesn't exist, that's okay
-    log("No remote base branch found, creating new local branch", "info");
+  // Only try to set upstream if a selectedBranch was provided
+  if (selectedBranch) {
+    try {
+      await execGit(
+        ["branch", `--set-upstream-to=${PATCHES_REMOTE}/${selectedBranch}`],
+        "Failed to set upstream"
+      );
+    } catch (e) {
+      // If the remote branch doesn't exist, that's okay
+      log("No remote branch found, creating new local branch", "info");
+    }
   }
-
-  const config = await getPatchConfig();
-  await savePatchConfig(config);
 }
 
 async function handlePackageChanges() {
@@ -418,7 +377,7 @@ async function removePatch(patchName) {
 
     // Find the commit that applied this patch
     const patchCommit = await execGit(
-      ["log", "--grep", `^${patchName}$`, "--format=%H"],
+      ["log", "--grep", `^cow_${patchName}$`, "--format=%H"],
       "Failed to find patch commit"
     );
 
@@ -496,65 +455,72 @@ async function listPatches() {
     }
   }
 }
-// Installation management
-async function ensureGlobalLink() {
-  try {
-    await execa("npm", ["link"], { cwd: path.join(__dirname, "..") });
-    console.log("Global command link created successfully");
-  } catch (e) {
-    throw new Error(`Failed to create global command link: ${e.message}`);
-  }
-}
-
-async function nukePatches() {
-  const baseBranch = await getBaseBranch();
-  await execGit(["checkout", baseBranch], "Failed to checkout base branch");
-
-  try {
-    await execGit(["branch", "-D", BRANCH_NAME], "Failed to delete branch");
-    console.log(`Deleted branch ${BRANCH_NAME}`);
-  } catch (e) {
-    console.log(`Branch ${BRANCH_NAME} does not exist`);
-  }
-
-  try {
-    await execGit(
-      ["remote", "remove", PATCHES_REMOTE],
-      "Failed to remove remote"
-    );
-    console.log(`Removed remote ${PATCHES_REMOTE}`);
-  } catch (e) {
-    console.log(`Remote ${PATCHES_REMOTE} does not exist`);
-  }
-
-  try {
-    await execa("npm", ["unlink"], { cwd: path.join(__dirname, "..") });
-    console.log("Removed global command link");
-  } catch (e) {
-    console.log("Global command link does not exist");
-  }
-
-  console.log("Nuke completed successfully!");
-}
 
 async function resetPatches() {
-  const baseBranch = await getBaseBranch();
-  console.log("Removing all patches and upgrading to latest base version...");
-
-  await execGit(["checkout", baseBranch], "Failed to checkout base branch");
+  const spinner = ora("Starting reset process...").start();
   try {
-    await execGit(["branch", "-D", BRANCH_NAME], "Failed to delete branch");
-    console.log(`Deleted branch ${BRANCH_NAME}`);
-  } catch (e) {
-    console.log(`Branch ${BRANCH_NAME} does not exist`);
+    const baseBranch = await getBaseBranch();
+    spinner.text =
+      "Removing all patches and upgrading to latest base version...";
+
+    // Get current branch name before proceeding
+    const currentBranch = await getCurrentBranch();
+
+    // Get base branch upstream configuration
+    let originalBaseBranch;
+    try {
+      const upstream = await execGit(
+        ["rev-parse", "--abbrev-ref", `${baseBranch}@{upstream}`],
+        "Failed to get base branch upstream"
+      );
+      originalBaseBranch = upstream.replace("origin/", "");
+      spinner.text = `Found base branch upstream: ${originalBaseBranch}`;
+    } catch (e) {
+      // No upstream set for base branch, use the base branch itself
+      originalBaseBranch = baseBranch;
+      spinner.text = `Using default base branch: ${baseBranch}`;
+    }
+
+    // Checkout and clean base branch
+    await execGit(["checkout", baseBranch], "Failed to checkout base branch");
+
+    // Try to delete the current branch if it exists
+    try {
+      await execGit(["branch", "-D", currentBranch], "Failed to delete branch");
+      spinner.text = `Deleted branch ${currentBranch}`;
+    } catch (e) {
+      spinner.text = `Branch ${currentBranch} does not exist`;
+    }
+
+    // Sync with remote
+    spinner.text = "Syncing with remote repository...";
+    await syncBranches();
+
+    // Create new branch with the same name as before
+    spinner.text = "Recreating branch...";
+    await execGit(
+      ["checkout", "-b", currentBranch, baseBranch],
+      "Failed to create new branch"
+    );
+
+    // Set up upstream tracking
+    try {
+      await execGit(
+        ["branch", `--set-upstream-to=${PATCHES_REMOTE}/${originalBaseBranch}`],
+        "Failed to set upstream"
+      );
+    } catch (e) {
+      spinner.text = "No remote branch found, creating new local branch";
+    }
+
+    await setupPatchesRemote();
+
+    spinner.succeed("Reset completed successfully!");
+    await listPatches();
+  } catch (error) {
+    spinner.fail(`Reset failed: ${error.message}`);
+    throw error;
   }
-
-  await syncBranches();
-  await ensurePatchBranch();
-  await setupPatchesRemote();
-
-  console.log("Reset completed successfully!");
-  await listPatches();
 }
 
 let PROJECT_PATH;
@@ -703,9 +669,9 @@ async function interactiveInstall() {
     );
     spinner.succeed("Branch checked out");
 
-    // Setup patch management
+    // Setup patch management with selected branch
     spinner.start("Setting up patch management...");
-    await ensurePatchBranch();
+    await ensurePatchBranch(selectedBranch);
     spinner.succeed("Patch management configured");
 
     spinner.start("Installing dependencies...");
@@ -714,10 +680,6 @@ async function interactiveInstall() {
     });
     log(npmInstall.stdout, "info");
     spinner.succeed("Dependencies installed");
-
-    spinner.start("Creating global command link...");
-    await ensureGlobalLink();
-    spinner.succeed("Command link created");
 
     // Stop spinner for patch selection
     spinner.stop();
@@ -779,26 +741,6 @@ program
   .version(packageJson.version)
   .action(interactiveInstall); // Default action when no command is provided
 
-// Rest of the existing commands and functions remain the same...
-
-program
-  .command("install")
-  .description("Install the patch management system")
-  .action(async () => {
-    try {
-      await verifyRepo();
-      const baseBranch = await syncBranches();
-      await ensurePatchBranch();
-      await execa("npm", ["install"]);
-      await ensureGlobalLink();
-      console.log("Patch management system installed successfully!");
-      await listPatches();
-    } catch (e) {
-      console.error(`Installation failed: ${e.message}`);
-      process.exit(1);
-    }
-  });
-
 program
   .command("patch <patchName>")
   .description("Apply a specific patch")
@@ -821,7 +763,7 @@ program
   .description("Remove a specific patch")
   .action(async (patchName) => {
     try {
-      const cleanPatchName = patchName.replace(/^cow_/, '');
+      const cleanPatchName = patchName.replace(/^cow_/, "");
       await removePatch(cleanPatchName);
       await listPatches();
     } catch (e) {
@@ -854,18 +796,6 @@ program
     }
   });
 
-program
-  .command("nuke")
-  .description("Remove everything: patches, branch, remote, and global command")
-  .action(async () => {
-    try {
-      await nukePatches();
-    } catch (e) {
-      console.error(`Nuke failed: ${e.message}`);
-      process.exit(1);
-    }
-  });
-
 async function searchPatches(searchTerm = "") {
   await execGit(["remote", "update", PATCHES_REMOTE, "--prune"]);
 
@@ -878,11 +808,10 @@ async function searchPatches(searchTerm = "") {
     .split("\n")
     .map((b) => b.trim())
     .filter((b) => b.startsWith(`remotes/${PATCHES_REMOTE}/cow_`))
-    .filter((b) => !b.endsWith("-base")) // Filter out base branch
     .map((b) => b.replace(`remotes/${PATCHES_REMOTE}/`, ""))
     .map((b) => b.replace(`cow_`, "")); // Remove package prefix
 
-  console.log(remoteBranches)
+  console.log(remoteBranches);
   if (searchTerm) {
     return remoteBranches.filter((b) => b.includes(searchTerm));
   }
@@ -923,91 +852,6 @@ async function getPatchInfo(branchName) {
     relativeTime,
   };
 }
-
-async function publishPatch(branchName) {
-  // Verify we're on the correct branch
-  const currentBranch = await getCurrentBranch();
-  if (currentBranch !== branchName) {
-    throw new Error(
-      `Not on branch ${branchName}. Please checkout the branch first.`
-    );
-  }
-
-  const patchBranchName = `cow_${branchName}`;
-
-  // Check if patch branch already exists
-  const existingBranches = await searchPatches();
-  if (existingBranches.includes(patchBranchName)) {
-    // Compare diffs
-    const existingDiff = await getBranchDiff(
-      `${PATCHES_REMOTE}/${patchBranchName}`
-    );
-    const currentDiff = await getBranchDiff(branchName);
-
-    if (existingDiff === currentDiff) {
-      console.log(
-        `Patch ${patchBranchName} already exists with the same changes.`
-      );
-      return;
-    }
-
-    throw new Error(
-      `Patch ${patchBranchName} already exists with different changes.`
-    );
-  }
-
-  // Create new branch for the patch
-  await execGit(
-    ["checkout", "-b", patchBranchName],
-    "Failed to create patch branch"
-  );
-
-  // Get the base branch commit
-  const baseBranch = await getBaseBranch();
-  const baseCommit = await execGit(
-    ["merge-base", `${PACKAGE_NAME}-base`, branchName],
-    "Failed to find merge base"
-  );
-
-  // Squash all commits since the base branch
-  await execGit(
-    ["reset", "--soft", baseCommit],
-    "Failed to reset to base commit"
-  );
-
-  // Create single commit with all changes
-  await execGit(
-    ["commit", "-m", `Patch: ${branchName}`],
-    "Failed to create patch commit"
-  );
-
-  // Push to remote
-  await execGit(
-    ["push", "-u", PATCHES_REMOTE, patchBranchName],
-    "Failed to push patch branch"
-  );
-
-  // Return to original branch
-  await execGit(
-    ["checkout", branchName],
-    "Failed to return to development branch"
-  );
-
-  console.log(`Successfully published patch: ${patchBranchName}`);
-}
-
-// Add new commands to the CLI
-program
-  .command("publish <branchName>")
-  .description("Publish current branch as a patch")
-  .action(async (branchName) => {
-    try {
-      await publishPatch(branchName);
-    } catch (e) {
-      console.error(`Failed to publish patch: ${e.message}`);
-      process.exit(1);
-    }
-  });
 
 program
   .command("search [patchName]")
@@ -1147,12 +991,6 @@ program
                 "Failed to checkout dev branch"
               );
             }
-
-            // Set up config
-            const config = await getPatchConfig();
-            config.patchName = patchName;
-            config.type = "development";
-            await savePatchConfig(config);
 
             spinner.succeed(
               `Development environment initialized for ${patchName}`
