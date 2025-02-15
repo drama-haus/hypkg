@@ -734,68 +734,6 @@ async function interactiveInstall() {
   }
 }
 
-// Modified program setup
-program
-  .name(PACKAGE_NAME)
-  .description("Patch management system for game engine")
-  .version(packageJson.version)
-  .action(interactiveInstall); // Default action when no command is provided
-
-program
-  .command("patch <patchName>")
-  .description("Apply a specific patch")
-  .action(async (patchName) => {
-    try {
-      // Remove package prefix if it's already there
-      const cleanPatchName = patchName.startsWith(`cow_`)
-        ? patchName
-        : `cow_${patchName}`;
-      await applyPatch(cleanPatchName);
-      await listPatches();
-    } catch (e) {
-      console.error(`Failed to apply patch: ${e.message}`);
-      process.exit(1);
-    }
-  });
-
-program
-  .command("unpatch <patchName>")
-  .description("Remove a specific patch")
-  .action(async (patchName) => {
-    try {
-      const cleanPatchName = patchName.replace(/^cow_/, "");
-      await removePatch(cleanPatchName);
-      await listPatches();
-    } catch (e) {
-      console.error(`Failed to remove patch: ${e.message}`);
-      process.exit(1);
-    }
-  });
-
-program
-  .command("list")
-  .description("List all applied patches")
-  .action(async () => {
-    try {
-      await listPatches();
-    } catch (e) {
-      console.error(`Failed to list patches: ${e.message}`);
-      process.exit(1);
-    }
-  });
-
-program
-  .command("reset")
-  .description("Remove all patches and upgrade to latest base version")
-  .action(async () => {
-    try {
-      await resetPatches();
-    } catch (e) {
-      console.error(`Reset failed: ${e.message}`);
-      process.exit(1);
-    }
-  });
-
 async function searchPatches(searchTerm = "") {
   await execGit(["remote", "update", PATCHES_REMOTE, "--prune"]);
 
@@ -853,27 +791,6 @@ async function getPatchInfo(branchName) {
   };
 }
 
-program
-  .command("search [patchName]")
-  .description("Search for patches (lists all if no name provided)")
-  .action(async (patchName) => {
-    try {
-      const patches = await searchPatches(patchName);
-      console.log("\nAvailable patches:");
-      if (patches.length === 0) {
-        console.log("  No patches found");
-      } else {
-        for (const patch of patches) {
-          const { author, relativeTime } = await getPatchInfo(patch);
-          console.log(`  - ${patch} (by ${author}, ${relativeTime})`);
-        }
-      }
-    } catch (e) {
-      console.error(`Failed to search patches: ${e.message}`);
-      process.exit(1);
-    }
-  });
-
 // Convert Uint8Array to string
 function ab2str(buf) {
   return String.fromCharCode.apply(null, buf);
@@ -927,6 +844,14 @@ async function extractHypFile(filePath) {
     process.exit(1);
   }
 }
+
+program
+  .name(PACKAGE_NAME)
+  .description("Patch management system for game engine")
+  .version(packageJson.version)
+  .command("install")
+  .description("Interactive installation of the game engine")
+  .action(interactiveInstall);
 
 program
   .command("app")
@@ -1196,119 +1121,203 @@ program
       })
   );
 
-// Modified version command to work with patches
+// Create patches subcommand group
 program
-  .command("versions")
-  .description("List all available versions of a patch")
-  .argument("<patchName>", "name of the patch")
-  .action(async (patchName) => {
-    try {
-      const spinner = ora(`Fetching versions for ${patchName}`).start();
-
-      try {
-        await execGit(["fetch", "--all", "--tags"], "Failed to fetch updates");
-
-        const tags = await execGit(
-          ["tag", "-l", `${patchName}-v*`],
-          "Failed to list versions"
-        );
-
-        const versions = tags
-          .split("\n")
-          .filter((tag) => tag.trim())
-          .map((tag) => ({
-            tag,
-            version: tag.replace(`${patchName}-v`, ""),
-          }));
-
-        spinner.stop();
-
-        if (versions.length === 0) {
-          console.log(`No versions found for ${patchName}`);
-          return;
-        }
-
-        console.log(`\nAvailable versions for ${patchName}:`);
-        for (const { tag, version } of versions) {
-          const info = await execGit(
-            ["show", "-s", "--format=%an|%at", tag],
-            `Failed to get info for ${tag}`
-          );
-          const [author, timestamp] = info.split("|");
-          const relativeTime = getRelativeTime(parseInt(timestamp) * 1000);
-
-          console.log(`  - v${version} (by ${author}, ${relativeTime})`);
-        }
-      } catch (error) {
-        spinner.fail(`Failed to list versions: ${error.message}`);
-        throw error;
-      }
-    } catch (e) {
-      console.error(`Failed to list versions: ${e.message}`);
-      process.exit(1);
-    }
-  });
-
-// Modified install-version command
-program
-  .command("install-version")
-  .description("Install a specific version of a patch")
-  .argument("<patchName>", "name of the patch")
-  .argument("<version>", "version to install")
-  .action(async (patchName, version) => {
-    try {
-      const spinner = ora(`Installing ${patchName} v${version}`).start();
-
-      try {
-        // Fetch latest
-        await execGit(["fetch", "--all", "--tags"], "Failed to fetch updates");
-
-        const baseBranch = await getBaseBranch();
-        const currentBranch = await getCurrentBranch();
-
-        // Checkout base branch
-        if (currentBranch !== baseBranch) {
-          await execGit(
-            ["checkout", baseBranch],
-            "Failed to checkout base branch"
-          );
-        }
-
-        // Apply the specific version
+  .command("patch")
+  .description("Commands for managing patches")
+  .addCommand(
+    new Command("apply")
+      .description("Apply a specific patch")
+      .argument("<patchName>", "name of the patch to release")
+      .option("-v, --version <version>", "specific version to install")
+      .action(async (patchName, options) => {
         try {
-          await execGit(
-            ["cherry-pick", `${patchName}-v${version}`],
-            "Failed to apply patch version"
-          );
+          if (options.version) {
+            // If version is specified, use install-version logic
+            const spinner = ora(
+              `Installing ${patchName} v${options.version}`
+            ).start();
+            try {
+              await execGit(
+                ["fetch", "--all", "--tags"],
+                "Failed to fetch updates"
+              );
+              const baseBranch = await getBaseBranch();
+              const currentBranch = await getCurrentBranch();
+
+              if (currentBranch !== baseBranch) {
+                await execGit(
+                  ["checkout", baseBranch],
+                  "Failed to checkout base branch"
+                );
+              }
+
+              try {
+                await execGit(
+                  ["cherry-pick", `${patchName}-v${options.version}`],
+                  "Failed to apply patch version"
+                );
+              } catch (e) {
+                spinner.warn("Conflicts detected, attempting resolution...");
+                await execGit(
+                  ["cherry-pick", "--abort"],
+                  "Failed to abort cherry-pick"
+                );
+                await execGit(
+                  ["cherry-pick", "-n", `${patchName}-v${options.version}`],
+                  "Failed to apply patch version"
+                );
+
+                await handlePackageChanges();
+                await execGit(["add", "."], "Failed to stage changes");
+                await execGit(
+                  [
+                    "commit",
+                    "-m",
+                    `Installed ${patchName} v${options.version}`,
+                  ],
+                  "Failed to commit changes"
+                );
+              }
+
+              spinner.succeed(
+                `Successfully installed ${patchName} v${options.version}`
+              );
+            } catch (error) {
+              spinner.fail(`Failed to install version: ${error.message}`);
+              throw error;
+            }
+          } else {
+            // Regular patch apply logic
+            const cleanPatchName = patchName.startsWith(`cow_`)
+              ? patchName
+              : `cow_${patchName}`;
+            await applyPatch(cleanPatchName);
+          }
+          await listPatches();
         } catch (e) {
-          // Handle conflicts
-          spinner.warn("Conflicts detected, attempting resolution...");
-          await execGit(
-            ["cherry-pick", "--abort"],
-            "Failed to abort cherry-pick"
-          );
-          await execGit(
-            ["cherry-pick", "-n", `${patchName}-v${version}`],
-            "Failed to apply patch version"
-          );
-
-          await handlePackageChanges();
-          await execGit(["add", "."], "Failed to stage changes");
-          await execGit(
-            ["commit", "-m", `Installed ${patchName} v${version}`],
-            "Failed to commit changes"
-          );
+          console.error(`Failed to apply patch: ${e.message}`);
+          process.exit(1);
         }
+      })
+  )
+  .addCommand(
+    new Command("remove")
+      .description("Remove a specific patch")
+      .argument("<patchName>", "name of the patch to release")
+      .action(async (patchName) => {
+        try {
+          const cleanPatchName = patchName.replace(/^cow_/, "");
+          await removePatch(cleanPatchName);
+          await listPatches();
+        } catch (e) {
+          console.error(`Failed to remove patch: ${e.message}`);
+          process.exit(1);
+        }
+      })
+  )
+  .addCommand(
+    new Command("list")
+      .description("List all applied patches")
+      .action(async () => {
+        try {
+          await listPatches();
+        } catch (e) {
+          console.error(`Failed to list patches: ${e.message}`);
+          process.exit(1);
+        }
+      })
+  )
+  .addCommand(
+    new Command("reset")
+      .description("Remove all patches and upgrade to latest base version")
+      .action(async () => {
+        try {
+          await resetPatches();
+        } catch (e) {
+          console.error(`Reset failed: ${e.message}`);
+          process.exit(1);
+        }
+      })
+  )
+  .addCommand(
+    new Command("search")
+      .command("search [patchName]")
+      .description("Search for patches (lists all if no name provided)")
+      .action(async (patchName) => {
+        try {
+          const patches = await searchPatches(patchName);
+          console.log("\nAvailable patches:");
 
-        spinner.succeed(`Successfully installed ${patchName} v${version}`);
-      } catch (error) {
-        spinner.fail(`Failed to install version: ${error.message}`);
-        throw error;
-      }
-    } catch (e) {
-      console.error(`Failed to install version: ${e.message}`);
-      process.exit(1);
-    }
-  });
+          if (patches.length === 0) {
+            console.log("  No patches found");
+            return;
+          }
+
+          // If a specific patch is searched, show its versions too
+          if (patchName) {
+            await execGit(
+              ["fetch", "--all", "--tags"],
+              "Failed to fetch updates"
+            );
+            const tags = await execGit(
+              ["tag", "-l", `${patchName}-v*`],
+              "Failed to list versions"
+            );
+
+            const versions = tags
+              .split("\n")
+              .filter((tag) => tag.trim())
+              .map((tag) => ({
+                tag,
+                version: tag.replace(`${patchName}-v`, ""),
+              }));
+
+            // First show the patch info
+            for (const patch of patches) {
+              const { author, relativeTime } = await getPatchInfo(patch);
+              console.log(`  - ${patch} (by ${author}, ${relativeTime})`);
+            }
+
+            // Then show version info if available
+            if (versions.length > 0) {
+              console.log(`\nAvailable versions:`);
+              for (const { tag, version } of versions) {
+                const info = await execGit(
+                  ["show", "-s", "--format=%an|%at", tag],
+                  "Failed to get info for ${tag}"
+                );
+                const [author, timestamp] = info.split("|");
+                const relativeTime = getRelativeTime(
+                  parseInt(timestamp) * 1000
+                );
+
+                console.log(`  - v${version} (by ${author}, ${relativeTime})`);
+              }
+            }
+          } else {
+            // Show all patches without versions
+            for (const patch of patches) {
+              const { author, relativeTime } = await getPatchInfo(patch);
+              console.log(`  - ${patch} (by ${author}, ${relativeTime})`);
+            }
+          }
+        } catch (e) {
+          console.error(`Failed to search patches: ${e.message}`);
+          process.exit(1);
+        }
+      })
+  );
+
+// Make the root command (no arguments) run install
+program.action((options, command) => {
+  // Only run install if no other command was specified
+  if (command.args.length === 0) {
+    interactiveInstall();
+  } else {
+    console.log("ERROR: unrecognized command\n\n")
+    program.help()
+  }
+});
 
 program.parse();
