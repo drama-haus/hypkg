@@ -2,6 +2,8 @@
 
 const DEBUG = false;
 
+const utils = require("../utils");
+
 const { program, Command } = require("commander");
 const execa = require("execa");
 const inquirer = require("inquirer");
@@ -10,7 +12,14 @@ const chalk = require("chalk"); // For colored output
 const path = require("path");
 const fs = require("fs").promises;
 
-const packageJson = require(path.join(__dirname, "..", "package.json"));
+const packageJson = require("../package.json");
+const config = {
+  patchesRepo: packageJson.config.patchesRepo,
+  patchesRemote: packageJson.config.patchesRemoteName,
+  targetRepo: packageJson.config.targetRepo,
+  packageName: packageJson.name,
+};
+
 const PATCHES_REPO = packageJson.config.patchesRepo;
 const PATCHES_REMOTE = packageJson.config.patchesRemoteName;
 const TARGET_REPO = packageJson.config.targetRepo;
@@ -30,277 +39,20 @@ function log(message, type = "info") {
   console.log(`${prefix} ${message}`);
 }
 
-// Git state management
-async function saveGitState() {
-  const currentBranch = await getCurrentBranch();
-  const stashName = `backup-${Date.now()}`;
-  const hasChanges =
-    (await execGit(["status", "--porcelain"], "Failed to check git status"))
-      .length > 0;
-
-  if (hasChanges) {
-    await execGit(
-      ["stash", "push", "-m", stashName],
-      "Failed to stash changes"
-    );
-  }
-
-  return {
-    branch: currentBranch,
-    stashName: hasChanges ? stashName : null,
-    commit: await execGit(
-      ["rev-parse", "HEAD"],
-      "Failed to get current commit"
-    ),
-  };
-}
-
-async function restoreGitState(state) {
-  // First, reset any half-applied changes
-  await execGit(["reset", "--hard", "HEAD"], "Failed to reset changes");
-
-  // Checkout original branch
-  await execGit(
-    ["checkout", state.branch],
-    "Failed to restore original branch"
-  );
-
-  // Reset to original commit
-  await execGit(
-    ["reset", "--hard", state.commit],
-    "Failed to reset to original commit"
-  );
-
-  // Restore stashed changes if any
-  if (state.stashName) {
-    const stashList = await execGit(
-      ["stash", "list"],
-      "Failed to list stashes"
-    );
-    const stashIndex = stashList
-      .split("\n")
-      .findIndex((line) => line.includes(state.stashName));
-
-    if (stashIndex !== -1) {
-      await execGit(
-        ["stash", "pop", `stash@{${stashIndex}}`],
-        "Failed to restore stashed changes"
-      );
-    }
-  }
-}
-
-// Git utilities
-async function execGit(args, errorMessage) {
-  const command = `git ${args.join(" ")}`;
-  if (DEBUG) log(`${command}`, "step");
-
-  try {
-    const result = await execa("git", args);
-    if (result.stdout.trim() && DEBUG) {
-      log(`Output: ${result.stdout.trim()}`, "info");
-    }
-    return result.stdout.trim();
-  } catch (e) {
-    log(`${errorMessage}: ${e.message}`, "error");
-    throw new Error(`${errorMessage}: ${e.message}`);
-  }
-}
-
-async function getCurrentBranch() {
-  return execGit(["branch", "--show-current"], "Failed to get current branch");
-}
-
-async function getBaseBranch() {
-  const branches = await execGit(["branch", "-a"], "Failed to get branches");
-  const hasDev = branches.includes("dev");
-  return hasDev ? "dev" : "main";
-}
-
-async function getAppliedPatches() {
-  const baseBranch = await getBaseBranch();
-  try {
-    const commits = await execGit(
-      ["log", `${baseBranch}..HEAD`, "--grep=^cow_", "--format=%s"],
-      "Failed to get patch commits"
-    );
-
-    return commits
-      .split("\n")
-      .filter(Boolean)
-      .map((commit) => {
-        const match = commit.match(/^cow_(.+)$/);
-        return match ? match[1] : null;
-      })
-      .filter(Boolean);
-  } catch (e) {
-    return [];
-  }
-}
-
-// Repository management
-async function verifyRepo() {
-  const origin = await execGit(
-    ["remote", "get-url", "origin"],
-    "Failed to get origin URL"
-  );
-  if (!origin.includes(TARGET_REPO.replace(".git", ""))) {
-    throw new Error(
-      `Not in the correct repository. Expected origin to be ${TARGET_REPO}`
-    );
-  }
-}
-
-async function setupPatchesRemote() {
-  const remotes = await execGit(["remote"], "Failed to list remotes");
-  if (!remotes.includes(PATCHES_REMOTE)) {
-    await execGit(
-      ["remote", "add", PATCHES_REMOTE, PATCHES_REPO],
-      "Failed to add patches remote"
-    );
-  }
-  await execGit(["fetch", PATCHES_REMOTE], "Failed to fetch patches remote");
-}
-
-// Branch management
-async function syncBranches() {
-  const spinner = ora("Syncing branches...").start();
-
-  try {
-    await execGit(["fetch", "origin"], "Failed to fetch origin");
-    const baseBranch = await getBaseBranch();
-    spinner.text = `Using ${baseBranch} as base branch`;
-    await execGit(["checkout", baseBranch], "Failed to checkout base branch");
-    await execGit(["pull", "origin", baseBranch], "Failed to pull base branch");
-
-    spinner.succeed(`Successfully synced with ${baseBranch}`);
-    return baseBranch;
-  } catch (error) {
-    spinner.fail("Failed to sync branches");
-    throw error;
-  }
-}
-
-async function ensurePatchBranch(selectedBranch) {
-  await setupPatchesRemote();
-  const branches = await execGit(["branch"], "Failed to list branches");
-  const branchExists = branches
-    .split("\n")
-    .map((b) => b.trim())
-    .includes(selectedBranch);
-
-  if (!branchExists) {
-    // Create a new branch from the current HEAD
-    const baseBranch = await getBaseBranch();
-    await execGit(
-      ["checkout", "-b", BRANCH_NAME, baseBranch],
-      "Failed to create patch branch"
-    );
-  } else {
-    await execGit(["checkout", BRANCH_NAME], "Failed to checkout patch branch");
-  }
-
-  // Only try to set upstream if a selectedBranch was provided
-  if (selectedBranch) {
-    try {
-      await execGit(
-        ["branch", `--set-upstream-to=${PATCHES_REMOTE}/${selectedBranch}`],
-        "Failed to set upstream"
-      );
-    } catch (e) {
-      // If the remote branch doesn't exist, that's okay
-      log("No remote branch found, creating new local branch", "info");
-    }
-  }
-}
-
-async function handlePackageChanges() {
-  const spinner = ora("Checking package dependencies...").start();
-
-  try {
-    // Check for package-lock.json conflicts
-    const hasLockConflict = await execGit(
-      ["diff", "--name-only", "--diff-filter=U"],
-      "Failed to check conflicts"
-    ).then((output) =>
-      output.split("\n").some((file) => file === "package-lock.json")
-    );
-
-    if (hasLockConflict) {
-      spinner.text = "Resolving package-lock.json conflicts...";
-
-      // Remove conflicted package-lock.json
-      await fs.unlink("package-lock.json").catch(() => {
-        log("No existing package-lock.json found", "info");
-      });
-
-      // Regenerate package-lock.json
-      spinner.text = "Regenerating package-lock.json...";
-      try {
-        const npmResult = await execa(
-          "npm",
-          ["install", "--package-lock-only"],
-          {
-            stdio: ["pipe", "pipe", "pipe"],
-          }
-        );
-        log(npmResult.stdout, "info");
-      } catch (e) {
-        spinner.fail("Failed to regenerate package-lock.json");
-        throw e;
-      }
-
-      // Stage regenerated package-lock.json
-      await execGit(
-        ["add", "package-lock.json"],
-        "Failed to stage regenerated package-lock.json"
-      );
-
-      spinner.succeed("Package lock file regenerated successfully");
-      return true;
-    }
-
-    // Check if we need to run regular npm install
-    const packageLockExists = await fs
-      .access("package-lock.json")
-      .then(() => true)
-      .catch(() => false);
-
-    if (!packageLockExists) {
-      spinner.text = "Installing dependencies...";
-      try {
-        const npmResult = await execa("npm", ["install"], {
-          stdio: ["pipe", "pipe", "pipe"],
-        });
-        log(npmResult.stdout, "info");
-      } catch (e) {
-        spinner.fail("Failed to install dependencies");
-        throw e;
-      }
-    }
-
-    spinner.succeed("Dependencies handled successfully");
-    return false;
-  } catch (error) {
-    spinner.fail("Failed to handle package changes");
-    throw error;
-  }
-}
-
 async function applyPatch(patchName) {
   const spinner = ora(`Applying patch: ${patchName}`).start();
-  const appliedPatches = await getAppliedPatches();
+  const appliedPatches = await utils.getAppliedPatches();
 
   if (appliedPatches.includes(patchName)) {
     spinner.info(`Patch ${patchName} is already applied`);
     return;
   }
 
-  const initialState = await saveGitState();
+  const initialState = await utils.saveGitState();
 
   try {
     spinner.text = "Finding patch commit...";
-    const commit = await execGit(
+    const commit = await utils.execGit(
       ["rev-list", "-n", "1", `${PATCHES_REMOTE}/${patchName}`, "^HEAD"],
       `Failed to find commit for patch ${patchName}`
     );
@@ -312,10 +64,13 @@ async function applyPatch(patchName) {
 
     try {
       spinner.text = "Applying patch changes...";
-      await execGit(["cherry-pick", commit], "Failed to cherry-pick commit");
+      await utils.execGit(
+        ["cherry-pick", commit],
+        "Failed to cherry-pick commit"
+      );
 
       // Update commit message to track patch
-      await execGit(
+      await utils.execGit(
         ["commit", "--amend", "-m", `${patchName}`],
         "Failed to update commit message"
       );
@@ -324,17 +79,20 @@ async function applyPatch(patchName) {
     } catch (cherryPickError) {
       spinner.warn("Cherry-pick failed, attempting alternative approach...");
 
-      await execGit(["cherry-pick", "--abort"], "Failed to abort cherry-pick");
-      await execGit(
+      await utils.execGit(
+        ["cherry-pick", "--abort"],
+        "Failed to abort cherry-pick"
+      );
+      await utils.execGit(
         ["cherry-pick", "-n", commit],
         "Failed to cherry-pick commit"
       );
 
       spinner.text = "Handling package dependencies...";
-      const handledLockConflict = await handlePackageChanges();
+      const handledLockConflict = await utils.handlePackageChanges();
 
       if (!handledLockConflict) {
-        const hasOtherConflicts = await execGit(
+        const hasOtherConflicts = await utils.execGit(
           ["diff", "--name-only", "--diff-filter=U"],
           "Failed to check conflicts"
         );
@@ -348,8 +106,8 @@ async function applyPatch(patchName) {
       }
 
       spinner.text = "Committing changes...";
-      await execGit(["add", "."], "Failed to stage changes");
-      await execGit(
+      await utils.execGit(["add", "."], "Failed to stage changes");
+      await utils.execGit(
         ["commit", "-m", `cow_${patchName}`],
         "Failed to commit changes"
       );
@@ -357,26 +115,26 @@ async function applyPatch(patchName) {
   } catch (error) {
     spinner.fail(`Failed to apply patch: ${error.message}`);
     log("Rolling back to initial state...", "warning");
-    await restoreGitState(initialState);
+    await utils.restoreGitState(initialState);
     throw error;
   }
 }
 
 async function removePatch(patchName) {
   const spinner = ora(`Removing patch: ${patchName}`).start();
-  const appliedPatches = await getAppliedPatches();
+  const appliedPatches = await utils.getAppliedPatches();
   if (!appliedPatches.includes(patchName)) {
     spinner.info(`Patch ${patchName} is not applied`);
     return;
   }
 
-  const initialState = await saveGitState();
+  const initialState = await utils.saveGitState();
 
   try {
-    const baseBranch = await getBaseBranch();
+    const baseBranch = await utils.getBaseBranch();
 
     // Find the commit that applied this patch
-    const patchCommit = await execGit(
+    const patchCommit = await utils.execGit(
       ["log", "--grep", `^cow_${patchName}$`, "--format=%H"],
       "Failed to find patch commit"
     );
@@ -387,16 +145,16 @@ async function removePatch(patchName) {
 
     // Create temporary branch
     const tempBranch = `temp-${Date.now()}`;
-    await execGit(["branch", tempBranch], "Failed to create temp branch");
+    await utils.execGit(["branch", tempBranch], "Failed to create temp branch");
 
     // Reset to base branch
-    await execGit(
+    await utils.execGit(
       ["reset", "--hard", baseBranch],
       "Failed to reset to base branch"
     );
 
     // Get all commits except the patch to remove
-    const commits = await execGit(
+    const commits = await utils.execGit(
       ["log", `${baseBranch}..${tempBranch}`, "--format=%H %s"],
       "Failed to get commit list"
     );
@@ -409,40 +167,49 @@ async function removePatch(patchName) {
 
       if (hash !== patchCommit) {
         try {
-          await execGit(["cherry-pick", hash], "Failed to cherry-pick commit");
+          await utils.execGit(
+            ["cherry-pick", hash],
+            "Failed to cherry-pick commit"
+          );
         } catch (e) {
-          await execGit(
+          await utils.execGit(
             ["cherry-pick", "--abort"],
             "Failed to abort cherry-pick"
           );
-          await execGit(
+          await utils.execGit(
             ["cherry-pick", "-n", hash],
             "Failed to cherry-pick commit"
           );
-          await handlePackageChanges();
-          await execGit(["add", "."], "Failed to stage changes");
-          await execGit(["commit", "-m", message], "Failed to commit changes");
+          await utils.handlePackageChanges();
+          await utils.execGit(["add", "."], "Failed to stage changes");
+          await utils.execGit(
+            ["commit", "-m", message],
+            "Failed to commit changes"
+          );
         }
       }
     }
 
     // Clean up temporary branch
-    await execGit(["branch", "-D", tempBranch], "Failed to delete temp branch");
+    await utils.execGit(
+      ["branch", "-D", tempBranch],
+      "Failed to delete temp branch"
+    );
 
     // Update dependencies
-    await handlePackageChanges();
+    await utils.handlePackageChanges();
 
     spinner.succeed(`Successfully removed patch: ${patchName}`);
   } catch (error) {
     spinner.fail(`Failed to remove patch: ${error.message}`);
     log("Rolling back to initial state...", "warning");
-    await restoreGitState(initialState);
+    await utils.restoreGitState(initialState);
     throw error;
   }
 }
 
 async function listPatches() {
-  const appliedPatches = await getAppliedPatches();
+  const appliedPatches = await utils.getAppliedPatches();
 
   console.log("\nCurrently applied patches:");
   if (appliedPatches.length === 0) {
@@ -459,17 +226,17 @@ async function listPatches() {
 async function resetPatches() {
   const spinner = ora("Starting reset process...").start();
   try {
-    const baseBranch = await getBaseBranch();
+    const baseBranch = await utils.getBaseBranch();
     spinner.text =
       "Removing all patches and upgrading to latest base version...";
 
     // Get current branch name before proceeding
-    const currentBranch = await getCurrentBranch();
+    const currentBranch = await utils.getCurrentBranch();
 
     // Get base branch upstream configuration
     let originalBaseBranch;
     try {
-      const upstream = await execGit(
+      const upstream = await utils.execGit(
         ["rev-parse", "--abbrev-ref", `${baseBranch}@{upstream}`],
         "Failed to get base branch upstream"
       );
@@ -482,11 +249,17 @@ async function resetPatches() {
     }
 
     // Checkout and clean base branch
-    await execGit(["checkout", baseBranch], "Failed to checkout base branch");
+    await utils.execGit(
+      ["checkout", baseBranch],
+      "Failed to checkout base branch"
+    );
 
     // Try to delete the current branch if it exists
     try {
-      await execGit(["branch", "-D", currentBranch], "Failed to delete branch");
+      await utils.execGit(
+        ["branch", "-D", currentBranch],
+        "Failed to delete branch"
+      );
       spinner.text = `Deleted branch ${currentBranch}`;
     } catch (e) {
       spinner.text = `Branch ${currentBranch} does not exist`;
@@ -494,18 +267,18 @@ async function resetPatches() {
 
     // Sync with remote
     spinner.text = "Syncing with remote repository...";
-    await syncBranches();
+    await utils.syncBranches();
 
     // Create new branch with the same name as before
     spinner.text = "Recreating branch...";
-    await execGit(
+    await utils.execGit(
       ["checkout", "-b", currentBranch, baseBranch],
       "Failed to create new branch"
     );
 
     // Set up upstream tracking
     try {
-      await execGit(
+      await utils.execGit(
         ["branch", `--set-upstream-to=${PATCHES_REMOTE}/${originalBaseBranch}`],
         "Failed to set upstream"
       );
@@ -513,7 +286,7 @@ async function resetPatches() {
       spinner.text = "No remote branch found, creating new local branch";
     }
 
-    await setupPatchesRemote();
+    await utils.setupPatchesRemote(config.patchesRepo, config.patchesRemote);
 
     spinner.succeed("Reset completed successfully!");
     await listPatches();
@@ -542,8 +315,8 @@ async function promptForNewProject() {
   process.chdir(projectPath);
   PROJECT_PATH = projectPath;
   // Initialize git repo
-  await execGit(["init"], "Failed to initialize git repository");
-  await execGit(
+  await utils.execGit(["init"], "Failed to initialize git repository");
+  await utils.execGit(
     ["remote", "add", "origin", TARGET_REPO],
     "Failed to add origin remote"
   );
@@ -551,8 +324,11 @@ async function promptForNewProject() {
 }
 
 async function promptForBranch() {
-  const currentBranch = await getCurrentBranch();
-  const branches = await execGit(["branch", "-a"], "Failed to list branches");
+  const currentBranch = await utils.getCurrentBranch();
+  const branches = await utils.execGit(
+    ["branch", "-a"],
+    "Failed to list branches"
+  );
   const availableBranches = branches
     .split("\n")
     .map((b) => b.trim().replace("* ", ""))
@@ -613,7 +389,7 @@ async function interactiveInstall() {
     if (isGitRepo) {
       const spinner = ora("Checking repository...").start();
       try {
-        await verifyRepo();
+        await utils.verifyRepo();
         spinner.succeed("Found existing repository");
         // If we're in the correct repo, just run list command
         await listPatches();
@@ -639,22 +415,22 @@ async function interactiveInstall() {
     // Now we can start using spinners again for operations
     let spinner = ora("Setting up repository...").start();
 
-    try {
-      await verifyRepo();
-      spinner.succeed("Repository configured");
-    } catch (e) {
-      // Configuration failed, but we'll set it up
-      spinner.text = "Configuring repository...";
-      await execGit(
-        ["remote", "add", "origin", TARGET_REPO],
-        "Failed to add origin remote"
-      );
-      spinner.succeed("Repository configured");
-    }
+    // try {
+    //   await utils.verifyRepo();
+    //   spinner.succeed("Repository configured");
+    // } catch (e) {
+    //   // Configuration failed, but we'll set it up
+    //   spinner.text = "Configuring repository...";
+    //   await utils.execGit(
+    //     ["remote", "add", "origin", TARGET_REPO],
+    //     "Failed to add origin remote"
+    //   );
+    //   spinner.succeed("Repository configured");
+    // }
 
     // Sync branches
     spinner.text = "Syncing branches...";
-    await syncBranches();
+    await utils.syncBranches();
     spinner.succeed("Branches synced");
 
     // Stop spinner for branch selection
@@ -663,15 +439,21 @@ async function interactiveInstall() {
 
     // Resume spinner for next operations
     spinner.start("Checking out selected branch...");
-    await execGit(
+    await utils.execGit(
       ["checkout", selectedBranch],
       "Failed to checkout selected branch"
     );
     spinner.succeed("Branch checked out");
 
+    await utils.setupPatchesRemote(config.patchesRepo, config.patchesRemote);
+
     // Setup patch management with selected branch
     spinner.start("Setting up patch management...");
-    await ensurePatchBranch(selectedBranch);
+    await utils.ensurePatchBranch(
+      BRANCH_NAME, // The branch name you want to use (like projectName or PACKAGE_NAME)
+      selectedBranch, // The branch selected by the user or default branch
+      config.patchesRemote // The patches remote from your config
+    );
     spinner.succeed("Patch management configured");
 
     spinner.start("Installing dependencies...");
@@ -735,9 +517,9 @@ async function interactiveInstall() {
 }
 
 async function searchPatches(searchTerm = "") {
-  await execGit(["remote", "update", PATCHES_REMOTE, "--prune"]);
+  await utils.execGit(["remote", "update", PATCHES_REMOTE, "--prune"]);
 
-  const branches = await execGit(
+  const branches = await utils.execGit(
     ["branch", "-a"],
     "Failed to list all branches"
   );
@@ -777,7 +559,7 @@ function getRelativeTime(timestamp) {
 
 async function getPatchInfo(branchName) {
   const fullBranchName = `${PATCHES_REMOTE}/cow_${branchName}`;
-  const commitInfo = await execGit(
+  const commitInfo = await utils.execGit(
     ["log", "-1", "--format=%an|%at", fullBranchName],
     `Failed to get commit info for ${branchName}`
   );
@@ -895,23 +677,23 @@ program
           ).start();
 
           try {
-            const baseBranch = await getBaseBranch();
+            const baseBranch = await utils.getBaseBranch();
 
             // Fetch latest changes
-            await execGit(["fetch", "origin"], "Failed to fetch updates");
+            await utils.execGit(["fetch", "origin"], "Failed to fetch updates");
 
             // Create dev branch if it doesn't exist
-            const branches = await execGit(
+            const branches = await utils.execGit(
               ["branch"],
               "Failed to list branches"
             );
             if (!branches.includes(devBranch)) {
-              await execGit(
+              await utils.execGit(
                 ["checkout", "-b", devBranch, baseBranch],
                 "Failed to create dev branch"
               );
             } else {
-              await execGit(
+              await utils.execGit(
                 ["checkout", devBranch],
                 "Failed to checkout dev branch"
               );
@@ -946,8 +728,8 @@ program
           ).start();
 
           try {
-            const baseBranch = await getBaseBranch();
-            const currentBranch = await getCurrentBranch();
+            const baseBranch = await utils.getBaseBranch();
+            const currentBranch = await utils.getCurrentBranch();
 
             // Verify we're on dev branch
             if (currentBranch !== devBranch) {
@@ -957,10 +739,10 @@ program
             }
 
             // Fetch and rebase
-            await execGit(["fetch", "origin"], "Failed to fetch updates");
+            await utils.execGit(["fetch", "origin"], "Failed to fetch updates");
 
             try {
-              await execGit(
+              await utils.execGit(
                 ["rebase", `origin/${baseBranch}`],
                 "Failed to rebase on base branch"
               );
@@ -969,10 +751,10 @@ program
               spinner.warn(
                 "Conflicts detected during rebase, attempting resolution..."
               );
-              const hasLockConflict = await handlePackageChanges();
+              const hasLockConflict = await utils.handlePackageChanges();
 
               if (!hasLockConflict) {
-                const hasOtherConflicts = await execGit(
+                const hasOtherConflicts = await utils.execGit(
                   ["diff", "--name-only", "--diff-filter=U"],
                   "Failed to check conflicts"
                 );
@@ -985,7 +767,7 @@ program
                 }
               }
 
-              await execGit(
+              await utils.execGit(
                 ["rebase", "--continue"],
                 "Failed to continue rebase"
               );
@@ -997,7 +779,10 @@ program
           } catch (error) {
             spinner.fail(`Update failed: ${error.message}`);
             try {
-              await execGit(["rebase", "--abort"], "Failed to abort rebase");
+              await utils.execGit(
+                ["rebase", "--abort"],
+                "Failed to abort rebase"
+              );
             } catch (e) {
               // Ignore error if no rebase in progress
             }
@@ -1024,7 +809,7 @@ program
           try {
             const devBranch = `dev_cow_${patchName}`;
             const releaseBranch = `cow_${patchName}`;
-            const currentBranch = await getCurrentBranch();
+            const currentBranch = await utils.getCurrentBranch();
 
             // Verify we're on dev branch
             if (currentBranch !== devBranch) {
@@ -1034,25 +819,25 @@ program
             }
 
             // Create or checkout release branch from main
-            const baseBranch = await getBaseBranch();
+            const baseBranch = await utils.getBaseBranch();
             const branches = (
-              await execGit(["branch"], "Failed to list branches")
+              await utils.execGit(["branch"], "Failed to list branches")
             )
               .split("\n")
               .map((branch) => branch.trim().replace("* ", ""))
               .filter(Boolean);
 
             if (!branches.includes(releaseBranch)) {
-              await execGit(
+              await utils.execGit(
                 ["checkout", "-b", releaseBranch, baseBranch],
                 "Failed to create release branch"
               );
             } else {
-              await execGit(
+              await utils.execGit(
                 ["checkout", releaseBranch],
                 "Failed to checkout release branch"
               );
-              await execGit(
+              await utils.execGit(
                 ["reset", "--hard", baseBranch],
                 "Failed to reset release branch"
               );
@@ -1060,27 +845,27 @@ program
 
             // Squash merge all changes from dev branch
             try {
-              await execGit(
+              await utils.execGit(
                 ["merge", "--squash", devBranch],
                 "Failed to merge dev changes"
               );
-              await execGit(
+              await utils.execGit(
                 ["commit", "-m", `${patchName} v${version}`],
                 "Failed to commit release"
               );
             } catch (e) {
               // Handle conflicts
               spinner.warn("Conflicts detected, attempting resolution...");
-              await handlePackageChanges();
-              await execGit(["add", "."], "Failed to stage changes");
-              await execGit(
+              await utils.handlePackageChanges();
+              await utils.execGit(["add", "."], "Failed to stage changes");
+              await utils.execGit(
                 ["commit", "-m", `${patchName} v${version}`],
                 "Failed to commit release"
               );
             }
 
             // Create version tag
-            await execGit(
+            await utils.execGit(
               [
                 "tag",
                 "-a",
@@ -1092,17 +877,17 @@ program
             );
 
             // Push changes and tags
-            await execGit(
+            await utils.execGit(
               ["push", "-f", PATCHES_REMOTE, releaseBranch],
               "Failed to push release branch"
             );
-            await execGit(
+            await utils.execGit(
               ["push", PATCHES_REMOTE, `${patchName}-v${version}`],
               "Failed to push tag"
             );
 
             // Return to original branch
-            await execGit(
+            await utils.execGit(
               ["checkout", currentBranch],
               "Failed to return to original branch"
             );
@@ -1138,39 +923,39 @@ program
               `Installing ${patchName} v${options.version}`
             ).start();
             try {
-              await execGit(
+              await utils.execGit(
                 ["fetch", "--all", "--tags"],
                 "Failed to fetch updates"
               );
-              const baseBranch = await getBaseBranch();
-              const currentBranch = await getCurrentBranch();
+              const baseBranch = await utils.getBaseBranch();
+              const currentBranch = await utils.getCurrentBranch();
 
               if (currentBranch !== baseBranch) {
-                await execGit(
+                await utils.execGit(
                   ["checkout", baseBranch],
                   "Failed to checkout base branch"
                 );
               }
 
               try {
-                await execGit(
+                await utils.execGit(
                   ["cherry-pick", `${patchName}-v${options.version}`],
                   "Failed to apply patch version"
                 );
               } catch (e) {
                 spinner.warn("Conflicts detected, attempting resolution...");
-                await execGit(
+                await utils.execGit(
                   ["cherry-pick", "--abort"],
                   "Failed to abort cherry-pick"
                 );
-                await execGit(
+                await utils.execGit(
                   ["cherry-pick", "-n", `${patchName}-v${options.version}`],
                   "Failed to apply patch version"
                 );
 
-                await handlePackageChanges();
-                await execGit(["add", "."], "Failed to stage changes");
-                await execGit(
+                await utils.handlePackageChanges();
+                await utils.execGit(["add", "."], "Failed to stage changes");
+                await utils.execGit(
                   [
                     "commit",
                     "-m",
@@ -1256,11 +1041,11 @@ program
 
           // If a specific patch is searched, show its versions too
           if (patchName) {
-            await execGit(
+            await utils.execGit(
               ["fetch", "--all", "--tags"],
               "Failed to fetch updates"
             );
-            const tags = await execGit(
+            const tags = await utils.execGit(
               ["tag", "-l", `${patchName}-v*`],
               "Failed to list versions"
             );
@@ -1283,7 +1068,7 @@ program
             if (versions.length > 0) {
               console.log(`\nAvailable versions:`);
               for (const { tag, version } of versions) {
-                const info = await execGit(
+                const info = await utils.execGit(
                   ["show", "-s", "--format=%an|%at", tag],
                   "Failed to get info for ${tag}"
                 );
@@ -1315,8 +1100,8 @@ program.action((options, command) => {
   if (command.args.length === 0) {
     interactiveInstall();
   } else {
-    console.log("ERROR: unrecognized command\n\n")
-    program.help()
+    console.log("ERROR: unrecognized command\n\n");
+    program.help();
   }
 });
 
