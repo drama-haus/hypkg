@@ -531,7 +531,6 @@ async function searchPatches(searchTerm = "") {
     .map((b) => b.replace(`remotes/${PATCHES_REMOTE}/`, ""))
     .map((b) => b.replace(`cow_`, "")); // Remove package prefix
 
-  console.log(remoteBranches);
   if (searchTerm) {
     return remoteBranches.filter((b) => b.includes(searchTerm));
   }
@@ -1089,6 +1088,166 @@ program
           }
         } catch (e) {
           console.error(`Failed to search patches: ${e.message}`);
+          process.exit(1);
+        }
+      })
+  );
+
+// World management commands
+program
+  .command("world")
+  .description("Commands for managing the world folder")
+  .addCommand(
+    new Command("backup")
+      .description("Create a compressed backup of the world folder")
+      .action(async () => {
+        try {
+          const spinner = ora("Creating world backup...").start();
+
+          // Check if world folder exists
+          const worldPath = path.join(process.cwd(), "world");
+          try {
+            await fs.access(worldPath);
+          } catch (e) {
+            spinner.fail("World folder not found!");
+            process.exit(1);
+          }
+
+          // Create backups directory if it doesn't exist
+          const backupsDir = path.join(process.cwd(), "backups");
+          await fs.mkdir(backupsDir, { recursive: true });
+
+          // Create backup filename with timestamp
+          const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+          const backupFile = path.join(
+            backupsDir,
+            `world-backup-${timestamp}.zip`
+          );
+
+          // Create zip archive
+          const output = require("fs").createWriteStream(backupFile);
+          const archive = archiver("zip", {
+            zlib: { level: 9 }, // Maximum compression
+          });
+
+          // Set up archive event handlers
+          const archivePromise = new Promise((resolve, reject) => {
+            output.on("close", () => {
+              const size = (archive.pointer() / 1024 / 1024).toFixed(2);
+              resolve(size);
+            });
+
+            archive.on("error", (err) => {
+              reject(err);
+            });
+          });
+
+          // Add world directory to archive
+          archive.pipe(output);
+          archive.directory(worldPath, false);
+          await archive.finalize();
+
+          // Wait for archive to complete
+          const size = await archivePromise;
+          spinner.succeed(`World backup created: ${backupFile}`);
+          log(`Backup size: ${size} MB`, "info");
+        } catch (e) {
+          console.error(`Failed to create world backup: ${e.message}`);
+          process.exit(1);
+        }
+      })
+  )
+  .addCommand(
+    new Command("reset")
+      .description("Delete the world folder")
+      .action(async () => {
+        try {
+          const spinner = ora("Resetting world...").start();
+
+          const worldPath = path.join(process.cwd(), "world");
+
+          // Check if world folder exists
+          try {
+            await fs.access(worldPath);
+          } catch (e) {
+            spinner.info("World folder already deleted");
+            return;
+          }
+
+          // Delete world folder
+          await new Promise((resolve, reject) => {
+            rimraf(worldPath, (err) => {
+              if (err) reject(err);
+              else resolve();
+            });
+          });
+
+          spinner.succeed("World folder deleted");
+        } catch (e) {
+          console.error(`Failed to reset world: ${e.message}`);
+          process.exit(1);
+        }
+      })
+  )
+  .addCommand(
+    new Command("restore")
+      .description("Restore world from a backup file")
+      .argument(
+        "[backupFile]",
+        "backup file to restore from (optional - uses latest if not specified)"
+      )
+      .action(async (backupFile) => {
+        try {
+          const spinner = ora("Restoring world backup...").start();
+
+          // If no backup file specified, use the latest one
+          if (!backupFile) {
+            const backupsDir = path.join(process.cwd(), "backups");
+            try {
+              const files = await fs.readdir(backupsDir);
+              const backups = files
+                .filter(
+                  (f) => f.startsWith("world-backup-") && f.endsWith(".zip")
+                )
+                .sort()
+                .reverse();
+
+              if (backups.length === 0) {
+                spinner.fail("No backup files found in backups directory");
+                process.exit(1);
+              }
+
+              backupFile = path.join(backupsDir, backups[0]);
+              spinner.info(`Using latest backup: ${backups[0]}`);
+            } catch (e) {
+              spinner.fail("No backups directory found");
+              process.exit(1);
+            }
+          }
+
+          // Verify backup file exists and is accessible
+          try {
+            await fs.access(backupFile);
+          } catch (e) {
+            spinner.fail(`Backup file not found: ${backupFile}`);
+            process.exit(1);
+          }
+
+          // Delete existing world folder if it exists
+          const worldPath = path.join(process.cwd(), "world");
+          await new Promise((resolve, reject) => {
+            rimraf(worldPath, (err) => {
+              if (err) reject(err);
+              else resolve();
+            });
+          });
+
+          // Extract backup to world directory
+          await extract(backupFile, { dir: worldPath });
+
+          spinner.succeed("World restored successfully");
+        } catch (e) {
+          console.error(`Failed to restore world: ${e.message}`);
           process.exit(1);
         }
       })

@@ -11,9 +11,12 @@
   "author": "itspeezy",
   "license": "GPL-3.0-only",
   "dependencies": {
+    "archiver": "^7.0.1",
     "commander": "^11.0.0",
     "execa": "^5.1.1",
-    "inquirer": "^8.2.6"
+    "extract-zip": "^2.0.1",
+    "inquirer": "^8.2.6",
+    "rimraf": "^6.0.1"
   },
   "config": {
     "patchesRepo": "https://github.com/drama-haus/hyperfy.git",
