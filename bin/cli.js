@@ -11,6 +11,9 @@ const ora = require("ora"); // For spinner animations
 const chalk = require("chalk"); // For colored output
 const path = require("path");
 const fs = require("fs").promises;
+const archiver = require("archiver");
+const extract = require('extract-zip');
+const rimraf = require('rimraf');
 
 const packageJson = require("../package.json");
 const config = {
