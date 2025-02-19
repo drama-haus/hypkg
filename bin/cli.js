@@ -11,9 +11,8 @@ const ora = require("ora"); // For spinner animations
 const chalk = require("chalk"); // For colored output
 const path = require("path");
 const fs = require("fs").promises;
-const archiver = require("archiver");
-const extract = require('extract-zip');
-const rimraf = require('rimraf');
+
+const dotenv = require("dotenv");
 
 const packageJson = require("../package.json");
 const config = {
@@ -380,142 +379,66 @@ async function promptForPatches() {
   return selectedPatches;
 }
 
-// Modified install function with interactive setup
-async function interactiveInstall() {
+async function promptForEnvVariables(emptyVars) {
+  const questions = emptyVars.map((varName) => ({
+    type: "input",
+    name: varName,
+    message: `Enter value for ${varName}:`,
+    validate: (input) => {
+      if (input.trim().length === 0) {
+        return `${varName} cannot be empty`;
+      }
+      return true;
+    },
+  }));
+
+  const values = await inquirer.prompt(questions);
+  return values;
+}
+async function findEmptyEnvVariables(envFile) {
+  const content = await fs.readFile(envFile, "utf-8");
+  const vars = dotenv.parse(content);
+
+  return Object.entries(vars)
+    .filter(([_, value]) => value === "")
+    .map(([key]) => key);
+}
+
+async function writeEnvFile(envFile, variables) {
+  const content = await fs.readFile(envFile, "utf-8");
+  let newContent = content;
+
+  for (const [key, value] of Object.entries(variables)) {
+    const regex = new RegExp(`${key}=.*`);
+    newContent = newContent.replace(regex, `${key}=${value}`);
+  }
+
+  await fs.writeFile(".env", newContent);
+}
+
+async function setupEnvironment(spinner) {
+  spinner.start("Setting up environment...");
+
   try {
-    // Check if we're in a git repository - no spinner needed for this quick check
-    const isGitRepo = await fs
-      .access(".git")
-      .then(() => true)
-      .catch(() => false);
-
-    if (isGitRepo) {
-      const spinner = ora("Checking repository...").start();
-      try {
-        await utils.verifyRepo();
-        spinner.succeed("Found existing repository");
-        // If we're in the correct repo, just run list command
-        await listPatches();
-        return;
-      } catch (e) {
-        spinner.fail("Not in the correct repository");
-        console.log(
-          "Please run this command in a new directory to set up a new project."
-        );
-        process.exit(1);
-      }
-    }
-
-    // Stop any existing spinner before user input
-    log("Setting up a new project...", "info");
-
-    // Get project name and set up new repository - no spinner during user input
-    const projectPath = await promptForNewProject();
-
-    const projectName = path.basename(projectPath);
-    BRANCH_NAME = projectName; // Use project name for the branch instead of package name
-
-    // Now we can start using spinners again for operations
-    let spinner = ora("Setting up repository...").start();
-
-    // try {
-    //   await utils.verifyRepo();
-    //   spinner.succeed("Repository configured");
-    // } catch (e) {
-    //   // Configuration failed, but we'll set it up
-    //   spinner.text = "Configuring repository...";
-    //   await utils.execGit(
-    //     ["remote", "add", "origin", TARGET_REPO],
-    //     "Failed to add origin remote"
-    //   );
-    //   spinner.succeed("Repository configured");
-    // }
-
-    // Sync branches
-    spinner.text = "Syncing branches...";
-    await utils.syncBranches();
-    spinner.succeed("Branches synced");
-
-    // Stop spinner for branch selection
-    spinner.stop();
-    const selectedBranch = await promptForBranch();
-
-    // Resume spinner for next operations
-    spinner.start("Checking out selected branch...");
-    await utils.execGit(
-      ["checkout", selectedBranch],
-      "Failed to checkout selected branch"
-    );
-    spinner.succeed("Branch checked out");
-
-    await utils.setupPatchesRemote(config.patchesRepo, config.patchesRemote);
-
-    // Setup patch management with selected branch
-    spinner.start("Setting up patch management...");
-    await utils.ensurePatchBranch(
-      BRANCH_NAME, // The branch name you want to use (like projectName or PACKAGE_NAME)
-      selectedBranch, // The branch selected by the user or default branch
-      config.patchesRemote // The patches remote from your config
-    );
-    spinner.succeed("Patch management configured");
-
-    spinner.start("Installing dependencies...");
-    const npmInstall = await execa("npm", ["install"], {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    log(npmInstall.stdout, "info");
-    spinner.succeed("Dependencies installed");
-
-    // Stop spinner for patch selection
-    spinner.stop();
-    const selectedPatches = await promptForPatches();
-
-    if (selectedPatches.length > 0) {
-      for (const patch of selectedPatches) {
-        await applyPatch(`cow_${patch}`);
-      }
-    }
-
     // Copy environment file
-    spinner.start("Setting up environment...");
-    try {
-      await execa("cp", [".env.example", ".env"]);
+    await execa("cp", [".env.example", ".env"]);
+
+    // Find empty variables in .env.example
+    const emptyVars = await findEmptyEnvVariables(".env.example");
+
+    if (emptyVars.length > 0) {
+      spinner.info("Some environment variables need to be configured");
+      const values = await promptForEnvVariables(emptyVars);
+
+      // Write the new values to .env
+      await writeEnvFile(".env", values);
+      spinner.succeed("Environment configured with user input");
+    } else {
       spinner.succeed("Environment configured");
-    } catch (e) {
-      spinner.info("No .env.example file found, skipping environment setup");
-    }
-
-    // Display final information
-    log("\n🎮 Your game engine project is ready!", "success");
-    log("Here's what you need to know:", "info");
-    console.log(
-      chalk.cyan(`
-    Commands available:
-    → npm run dev         - Start the development server
-    → ${PACKAGE_NAME} list    - See your applied patches
-    → ${PACKAGE_NAME} search  - Browse available patches
-    → ${PACKAGE_NAME} patch   - Apply a new patch
-    `)
-    );
-
-    await listPatches();
-
-    log("\nStarting development server...", "step");
-
-    // Start the development server
-    try {
-      await execa("npm", ["run", "dev"], {
-        stdio: "inherit",
-      });
-    } catch (e) {
-      if (e.exitCode === 130) {
-        process.exit(0);
-      }
-      throw new Error(`Failed to start development server: ${e.message}`);
     }
   } catch (e) {
-    console.error(chalk.red(`Setup failed: ${e.message}`));
-    process.exit(1);
+    spinner.info("No .env.example file found, skipping environment setup");
+    console.error(e);
   }
 }
 
@@ -629,24 +552,140 @@ async function extractHypFile(filePath) {
   }
 }
 
+async function interactiveInstall(options = {}) {
+  try {
+    const isGitRepo = await fs
+      .access(".git")
+      .then(() => true)
+      .catch(() => false);
+
+    if (isGitRepo) {
+      const spinner = ora("Checking repository...").start();
+      try {
+        await utils.verifyRepo();
+        spinner.succeed("Found existing repository");
+        // If we're in the correct repo, just run list command
+        await listPatches();
+        return;
+      } catch (e) {
+        spinner.fail("Not in the correct repository");
+        console.log(
+          "Please run this command in a new directory to set up a new project."
+        );
+        process.exit(1);
+      }
+    }
+
+    // Stop any existing spinner before user input
+    log("Setting up a new project...", "info");
+
+    // Get project name and set up new repository - no spinner during user input
+    const projectPath = await promptForNewProject();
+
+    const projectName = path.basename(projectPath);
+    BRANCH_NAME = projectName; // Use project name for the branch instead of package name
+
+    // Now we can start using spinners again for operations
+    let spinner = ora("Setting up repository...").start();
+    // Sync branches
+    spinner.text = "Syncing branches...";
+    await utils.syncBranches();
+    spinner.succeed("Branches synced");
+
+    // Stop spinner for branch selection
+    spinner.stop();
+    const selectedBranch = await promptForBranch();
+
+    // Resume spinner for next operations
+    spinner.start("Checking out selected branch...");
+    await utils.execGit(
+      ["checkout", selectedBranch],
+      "Failed to checkout selected branch"
+    );
+    spinner.succeed("Branch checked out");
+
+    await utils.setupPatchesRemote(config.patchesRepo, config.patchesRemote);
+
+    // Setup patch management with selected branch
+    spinner.start("Setting up patch management...");
+    await utils.ensurePatchBranch(
+      BRANCH_NAME,
+      selectedBranch,
+      config.patchesRemote
+    );
+    spinner.succeed("Patch management configured");
+
+    // Stop spinner for patch selection
+    spinner.stop();
+    const selectedPatches = await promptForPatches();
+
+    if (selectedPatches.length > 0) {
+      for (const patch of selectedPatches) {
+        await applyPatch(`cow_${patch}`);
+      }
+    }
+
+    await setupEnvironment(spinner);
+
+    if (options.install) {
+      spinner.start("Installing dependencies...");
+      const npmInstall = await execa("npm", ["install"], {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      log(npmInstall.stdout, "info");
+      spinner.succeed("Dependencies installed");
+    }
+
+    // Display final information
+    log("\n🎮 Your game engine project is ready!", "success");
+    log("Here's what you need to know:", "info");
+    console.log(
+      chalk.cyan(`
+    Commands available:
+    → npm run dev         - Start the development server
+    → ${PACKAGE_NAME} list    - See your applied patches
+    → ${PACKAGE_NAME} search  - Browse available patches
+    → ${PACKAGE_NAME} patch   - Apply a new patch
+    `)
+    );
+
+    await listPatches();
+
+    if (options.install) {
+      log("\nStarting development server...", "step");
+
+      // Start the development server
+      try {
+        await execa("npm", ["run", "dev"], {
+          stdio: "inherit",
+        });
+      } catch (e) {
+        if (e.exitCode === 130) {
+          process.exit(0);
+        }
+        throw new Error(`Failed to start development server: ${e.message}`);
+      }
+    }
+  } catch (e) {
+    console.error(chalk.red(`Setup failed: ${e.message}`));
+    process.exit(1);
+  }
+}
+
 program
   .name(PACKAGE_NAME)
-  .description("Patch management system for game engine")
-  .version(packageJson.version)
+  .description("Hyperfy Core User OverWrites")
+  .version(packageJson.version);
+
+program
   .command("install")
   .description("Interactive installation of the game engine")
-  .action(interactiveInstall);
+  .option("--no-install", "Skip npm install and server startup")
+  .action((options) => interactiveInstall(options));
 
 program
   .command("app")
   .description("Hyperfy Apps Tools")
-  .addCommand(
-    new Command("pack")
-      .description("packs arguments into a .hyp file")
-      .action(async (args) => {
-        console.log(args);
-      })
-  )
   .addCommand(
     new Command("extract <file>")
       .description("Extract contents of a .hyp file")
@@ -1047,40 +1086,53 @@ program
               ["fetch", "--all", "--tags"],
               "Failed to fetch updates"
             );
-            const tags = await utils.execGit(
-              ["tag", "-l", `${patchName}-v*`],
+
+            // Get tag list
+            const tagsOutput = await utils.execGit(
+              [
+                "tag",
+                "-l",
+                `${patchName}-v*`,
+                "--format=%(tag)|%(taggername)|%(taggerdate:relative)|%(subject)",
+              ],
               "Failed to list versions"
             );
 
-            const versions = tags
+            const versions = tagsOutput
               .split("\n")
-              .filter((tag) => tag.trim())
-              .map((tag) => ({
-                tag,
-                version: tag.replace(`${patchName}-v`, ""),
-              }));
+              .filter(Boolean)
+              .map((line) => {
+                const [tag, tagger, date, subject] = line.split("|");
+                return {
+                  version: tag.replace(`${patchName}-v`, ""),
+                  tagger: tagger.trim(),
+                  date: date.trim(),
+                  description: subject.trim(),
+                };
+              });
 
             // First show the patch info
             for (const patch of patches) {
               const { author, relativeTime } = await getPatchInfo(patch);
-              console.log(`  - ${patch} (by ${author}, ${relativeTime})`);
+              console.log(chalk.cyan(`  ${patch}`));
+              console.log(`    Author: ${author}`);
+              console.log(`    Created: ${relativeTime}`);
             }
 
             // Then show version info if available
             if (versions.length > 0) {
-              console.log(`\nAvailable versions:`);
-              for (const { tag, version } of versions) {
-                const info = await utils.execGit(
-                  ["show", "-s", "--format=%an|%at", tag],
-                  "Failed to get info for ${tag}"
-                );
-                const [author, timestamp] = info.split("|");
-                const relativeTime = getRelativeTime(
-                  parseInt(timestamp) * 1000
-                );
-
-                console.log(`  - v${version} (by ${author}, ${relativeTime})`);
+              console.log(`\nVersions available:`);
+              for (const version of versions) {
+                console.log(chalk.green(`  v${version.version}`));
+                console.log(`    Author: ${version.tagger}`);
+                console.log(`    Released: ${version.date}`);
+                if (version.description) {
+                  console.log(`    Description: ${version.description}`);
+                }
+                console.log(); // Add a blank line between versions
               }
+            } else {
+              console.log("\nNo versions available");
             }
           } else {
             // Show all patches without versions
@@ -1090,177 +1142,137 @@ program
             }
           }
         } catch (e) {
-          console.error(`Failed to search patches: ${e.message}`);
+          console.error(chalk.red(`Failed to search patches: ${e.message}`));
           process.exit(1);
         }
       })
   );
 
-// World management commands
-program
-  .command("world")
-  .description("Commands for managing the world folder")
-  .addCommand(
-    new Command("backup")
-      .description("Create a compressed backup of the world folder")
-      .action(async () => {
-        try {
-          const spinner = ora("Creating world backup...").start();
+// First, let's add the utility function to get currently applied patches
+async function getAppliedPatches() {
+  const baseBranch = await utils.getBaseBranch();
+  const currentBranch = await utils.getCurrentBranch();
 
-          // Check if world folder exists
-          const worldPath = path.join(process.cwd(), "world");
-          try {
-            await fs.access(worldPath);
-          } catch (e) {
-            spinner.fail("World folder not found!");
-            process.exit(1);
-          }
+  // Get all commits between base branch and current branch
+  const output = await utils.execGit(
+    ["log", `${baseBranch}..${currentBranch}`, "--pretty=format:%s"],
+    "Failed to get commit history"
+  );
 
-          // Create backups directory if it doesn't exist
-          const backupsDir = path.join(process.cwd(), "backups");
-          await fs.mkdir(backupsDir, { recursive: true });
+  // Extract patch names from commit messages
+  return output
+    .split("\n")
+    .filter(
+      (msg) =>
+        msg.startsWith("Installed cow_") || msg.startsWith("Applied cow_")
+    )
+    .map((msg) => {
+      const match = msg.match(
+        /(?:Installed|Applied) (cow_[^\s]+)(?: v(\d+\.\d+\.\d+))?/
+      );
+      if (match) {
+        return {
+          name: match[1],
+          version: match[2] || null,
+        };
+      }
+      return null;
+    })
+    .filter(Boolean)
+    .reverse(); // Reverse to get them in application order
+}
 
-          // Create backup filename with timestamp
-          const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-          const backupFile = path.join(
-            backupsDir,
-            `world-backup-${timestamp}.zip`
+async function syncPatches() {
+  const spinner = ora("Starting patch synchronization...").start();
+
+  try {
+    // Store current patches before reset
+    spinner.text = "Getting currently applied patches...";
+    const appliedPatches = await getAppliedPatches();
+
+    // Reset to base branch
+    spinner.text = "Resetting to base branch...";
+    await resetPatches();
+
+    // Reapply each patch
+    for (const patch of appliedPatches) {
+      spinner.text = `Reapplying patch ${patch.name}${
+        patch.version ? ` v${patch.version}` : ""
+      }...`;
+
+      try {
+        if (patch.version) {
+          // Version-specific installation
+          await utils.execGit(
+            ["fetch", "--all", "--tags"],
+            "Failed to fetch updates"
           );
 
-          // Create zip archive
-          const output = require("fs").createWriteStream(backupFile);
-          const archive = archiver("zip", {
-            zlib: { level: 9 }, // Maximum compression
-          });
-
-          // Set up archive event handlers
-          const archivePromise = new Promise((resolve, reject) => {
-            output.on("close", () => {
-              const size = (archive.pointer() / 1024 / 1024).toFixed(2);
-              resolve(size);
-            });
-
-            archive.on("error", (err) => {
-              reject(err);
-            });
-          });
-
-          // Add world directory to archive
-          archive.pipe(output);
-          archive.directory(worldPath, false);
-          await archive.finalize();
-
-          // Wait for archive to complete
-          const size = await archivePromise;
-          spinner.succeed(`World backup created: ${backupFile}`);
-          log(`Backup size: ${size} MB`, "info");
-        } catch (e) {
-          console.error(`Failed to create world backup: ${e.message}`);
-          process.exit(1);
-        }
-      })
-  )
-  .addCommand(
-    new Command("reset")
-      .description("Delete the world folder")
-      .action(async () => {
-        try {
-          const spinner = ora("Resetting world...").start();
-
-          const worldPath = path.join(process.cwd(), "world");
-
-          // Check if world folder exists
           try {
-            await fs.access(worldPath);
+            await utils.execGit(
+              ["cherry-pick", `${patch.name}-v${patch.version}`],
+              "Failed to apply patch version"
+            );
           } catch (e) {
-            spinner.info("World folder already deleted");
-            return;
+            spinner.warn(
+              `Conflicts detected in ${patch.name}, attempting resolution...`
+            );
+            await utils.execGit(
+              ["cherry-pick", "--abort"],
+              "Failed to abort cherry-pick"
+            );
+            await utils.execGit(
+              ["cherry-pick", "-n", `${patch.name}-v${patch.version}`],
+              "Failed to apply patch version"
+            );
+
+            await utils.handlePackageChanges();
+            await utils.execGit(["add", "."], "Failed to stage changes");
+            await utils.execGit(
+              ["commit", "-m", `Installed ${patch.name} v${patch.version}`],
+              "Failed to commit changes"
+            );
           }
-
-          // Delete world folder
-          await new Promise((resolve, reject) => {
-            rimraf(worldPath, (err) => {
-              if (err) reject(err);
-              else resolve();
-            });
-          });
-
-          spinner.succeed("World folder deleted");
-        } catch (e) {
-          console.error(`Failed to reset world: ${e.message}`);
-          process.exit(1);
+        } else {
+          // Regular patch application
+          const cleanPatchName = patch.name.startsWith("cow_")
+            ? patch.name
+            : `cow_${patch.name}`;
+          await applyPatch(cleanPatchName);
         }
-      })
-  )
-  .addCommand(
-    new Command("restore")
-      .description("Restore world from a backup file")
-      .argument(
-        "[backupFile]",
-        "backup file to restore from (optional - uses latest if not specified)"
-      )
-      .action(async (backupFile) => {
-        try {
-          const spinner = ora("Restoring world backup...").start();
+      } catch (e) {
+        spinner.fail(`Failed to reapply ${patch.name}: ${e.message}`);
+        throw e;
+      }
+    }
 
-          // If no backup file specified, use the latest one
-          if (!backupFile) {
-            const backupsDir = path.join(process.cwd(), "backups");
-            try {
-              const files = await fs.readdir(backupsDir);
-              const backups = files
-                .filter(
-                  (f) => f.startsWith("world-backup-") && f.endsWith(".zip")
-                )
-                .sort()
-                .reverse();
+    spinner.succeed("Successfully synchronized all patches");
 
-              if (backups.length === 0) {
-                spinner.fail("No backup files found in backups directory");
-                process.exit(1);
-              }
+    // Show final patch list
+    await listPatches();
+  } catch (e) {
+    spinner.fail(`Sync failed: ${e.message}`);
+    throw e;
+  }
+}
 
-              backupFile = path.join(backupsDir, backups[0]);
-              spinner.info(`Using latest backup: ${backups[0]}`);
-            } catch (e) {
-              spinner.fail("No backups directory found");
-              process.exit(1);
-            }
-          }
-
-          // Verify backup file exists and is accessible
-          try {
-            await fs.access(backupFile);
-          } catch (e) {
-            spinner.fail(`Backup file not found: ${backupFile}`);
-            process.exit(1);
-          }
-
-          // Delete existing world folder if it exists
-          const worldPath = path.join(process.cwd(), "world");
-          await new Promise((resolve, reject) => {
-            rimraf(worldPath, (err) => {
-              if (err) reject(err);
-              else resolve();
-            });
-          });
-
-          // Extract backup to world directory
-          await extract(backupFile, { dir: worldPath });
-
-          spinner.succeed("World restored successfully");
-        } catch (e) {
-          console.error(`Failed to restore world: ${e.message}`);
-          process.exit(1);
-        }
-      })
-  );
+program
+  .command("sync")
+  .description("Reset and reapply all patches to ensure clean state")
+  .action(async () => {
+    try {
+      await syncPatches();
+    } catch (e) {
+      console.error(`Sync failed: ${e.message}`);
+      process.exit(1);
+    }
+  });
 
 // Make the root command (no arguments) run install
 program.action((options, command) => {
   // Only run install if no other command was specified
   if (command.args.length === 0) {
-    interactiveInstall();
+    interactiveInstall(options);
   } else {
     console.log("ERROR: unrecognized command\n\n");
     program.help();
