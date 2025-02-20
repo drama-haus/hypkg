@@ -298,8 +298,6 @@ async function resetPatches() {
   }
 }
 
-let PROJECT_PATH;
-// Interactive setup functions
 async function promptForNewProject() {
   const { projectName } = await inquirer.prompt([
     {
@@ -395,6 +393,7 @@ async function promptForEnvVariables(emptyVars) {
   const values = await inquirer.prompt(questions);
   return values;
 }
+
 async function findEmptyEnvVariables(envFile) {
   const content = await fs.readFile(envFile, "utf-8");
   const vars = dotenv.parse(content);
@@ -552,6 +551,114 @@ async function extractHypFile(filePath) {
   }
 }
 
+// First, let's add the utility function to get currently applied patches
+async function getAppliedPatches() {
+  const baseBranch = await utils.getBaseBranch();
+  const currentBranch = await utils.getCurrentBranch();
+
+  // Get all commits between base branch and current branch
+  const output = await utils.execGit(
+    ["log", `${baseBranch}..${currentBranch}`, "--pretty=format:%s"],
+    "Failed to get commit history"
+  );
+
+  // Extract patch names from commit messages
+  return output
+    .split("\n")
+    .filter(
+      (msg) =>
+        msg.startsWith("Installed cow_") || msg.startsWith("Applied cow_")
+    )
+    .map((msg) => {
+      const match = msg.match(
+        /(?:Installed|Applied) (cow_[^\s]+)(?: v(\d+\.\d+\.\d+))?/
+      );
+      if (match) {
+        return {
+          name: match[1],
+          version: match[2] || null,
+        };
+      }
+      return null;
+    })
+    .filter(Boolean)
+    .reverse(); // Reverse to get them in application order
+}
+
+async function syncPatches() {
+  const spinner = ora("Starting patch synchronization...").start();
+
+  try {
+    // Store current patches before reset
+    spinner.text = "Getting currently applied patches...";
+    const appliedPatches = await getAppliedPatches();
+
+    // Reset to base branch
+    spinner.text = "Resetting to base branch...";
+    await resetPatches();
+
+    // Reapply each patch
+    for (const patch of appliedPatches) {
+      spinner.text = `Reapplying patch ${patch.name}${
+        patch.version ? ` v${patch.version}` : ""
+      }...`;
+
+      try {
+        if (patch.version) {
+          // Version-specific installation
+          await utils.execGit(
+            ["fetch", "--all", "--tags"],
+            "Failed to fetch updates"
+          );
+
+          try {
+            await utils.execGit(
+              ["cherry-pick", `${patch.name}-v${patch.version}`],
+              "Failed to apply patch version"
+            );
+          } catch (e) {
+            spinner.warn(
+              `Conflicts detected in ${patch.name}, attempting resolution...`
+            );
+            await utils.execGit(
+              ["cherry-pick", "--abort"],
+              "Failed to abort cherry-pick"
+            );
+            await utils.execGit(
+              ["cherry-pick", "-n", `${patch.name}-v${patch.version}`],
+              "Failed to apply patch version"
+            );
+
+            await utils.handlePackageChanges();
+            await utils.execGit(["add", "."], "Failed to stage changes");
+            await utils.execGit(
+              ["commit", "-m", `Installed ${patch.name} v${patch.version}`],
+              "Failed to commit changes"
+            );
+          }
+        } else {
+          // Regular patch application
+          const cleanPatchName = patch.name.startsWith("cow_")
+            ? patch.name
+            : `cow_${patch.name}`;
+          await applyPatch(cleanPatchName);
+        }
+      } catch (e) {
+        spinner.fail(`Failed to reapply ${patch.name}: ${e.message}`);
+        throw e;
+      }
+    }
+
+    spinner.succeed("Successfully synchronized all patches");
+
+    // Show final patch list
+    await listPatches();
+  } catch (e) {
+    spinner.fail(`Sync failed: ${e.message}`);
+    throw e;
+  }
+}
+
 async function interactiveInstall(options = {}) {
   try {
     const isGitRepo = await fs
@@ -669,6 +776,248 @@ async function interactiveInstall(options = {}) {
   } catch (e) {
     console.error(chalk.red(`Setup failed: ${e.message}`));
     process.exit(1);
+  }
+}
+
+async function batchUpdateDevPatches(options = {}) {
+  const spinner = ora("Starting batch update of dev patches...").start();
+  const failedPatches = [];
+
+  try {
+    // Get all local branches
+    const branches = (
+      await utils.execGit(["branch"], "Failed to list branches")
+    )
+      .split("\n")
+      .map((b) => b.trim().replace("* ", ""))
+      .filter((b) => b.startsWith("dev_cow_"));
+
+    if (branches.length === 0) {
+      spinner.info("No dev patches found to update");
+      return;
+    }
+
+    spinner.info(`Found ${branches.length} dev patches to process`);
+
+    // Store current branch to return to it later
+    const originalBranch = await utils.getCurrentBranch();
+
+    for (const branch of branches) {
+      const patchName = branch.replace("dev_cow_", "");
+      spinner.text = `Processing ${patchName}...`;
+
+      try {
+        // Checkout the dev branch
+        await utils.execGit(
+          ["checkout", branch],
+          "Failed to checkout dev branch"
+        );
+
+        // Try to update the branch
+        try {
+          const baseBranch = await utils.getBaseBranch();
+          await utils.execGit(["fetch", "origin"], "Failed to fetch updates");
+
+          try {
+            await utils.execGit(
+              ["rebase", `origin/${baseBranch}`],
+              "Failed to rebase on base branch"
+            );
+          } catch (e) {
+            // Handle rebase conflicts
+            spinner.warn(
+              `Conflicts detected in ${patchName}, attempting resolution...`
+            );
+            const hasLockConflict = await utils.handlePackageChanges();
+
+            if (!hasLockConflict) {
+              const hasOtherConflicts = await utils.execGit(
+                ["diff", "--name-only", "--diff-filter=U"],
+                "Failed to check conflicts"
+              );
+
+              if (hasOtherConflicts) {
+                throw new Error("Unresolvable conflicts detected");
+              }
+            }
+
+            await utils.execGit(
+              ["rebase", "--continue"],
+              "Failed to continue rebase"
+            );
+          }
+
+          // If update successful, try to release
+          if (options.autoRelease) {
+            const version = await getNextPatchVersion(patchName);
+            const releaseBranch = `cow_${patchName}`;
+
+            // Create or checkout release branch from main
+            const branches = (
+              await utils.execGit(["branch"], "Failed to list branches")
+            )
+              .split("\n")
+              .map((b) => b.trim().replace("* ", ""))
+              .filter(Boolean);
+
+            if (!branches.includes(releaseBranch)) {
+              await utils.execGit(
+                ["checkout", "-b", releaseBranch, baseBranch],
+                "Failed to create release branch"
+              );
+            } else {
+              await utils.execGit(
+                ["checkout", releaseBranch],
+                "Failed to checkout release branch"
+              );
+              await utils.execGit(
+                ["reset", "--hard", baseBranch],
+                "Failed to reset release branch"
+              );
+            }
+
+            // Squash merge all changes from dev branch
+            try {
+              await utils.execGit(
+                ["merge", "--squash", branch],
+                "Failed to merge dev changes"
+              );
+              await utils.execGit(
+                ["commit", "-m", `${patchName} v${version}`],
+                "Failed to commit release"
+              );
+            } catch (e) {
+              // Handle conflicts
+              await utils.handlePackageChanges();
+              await utils.execGit(["add", "."], "Failed to stage changes");
+              await utils.execGit(
+                ["commit", "-m", `${patchName} v${version}`],
+                "Failed to commit release"
+              );
+            }
+
+            // Create version tag
+            await utils.execGit(
+              [
+                "tag",
+                "-a",
+                `${patchName}-v${version}`,
+                "-m",
+                `${patchName} version ${version}`,
+              ],
+              "Failed to create version tag"
+            );
+
+            // Push changes and tags
+            await utils.execGit(
+              ["push", "-f", PATCHES_REMOTE, releaseBranch],
+              "Failed to push release branch"
+            );
+            await utils.execGit(
+              ["push", PATCHES_REMOTE, `${patchName}-v${version}`],
+              "Failed to push tag"
+            );
+
+            spinner.succeed(
+              `Successfully updated and released ${patchName} v${version}`
+            );
+          } else {
+            spinner.succeed(`Successfully updated ${patchName}`);
+          }
+        } catch (error) {
+          failedPatches.push({
+            name: patchName,
+            error: error.message,
+          });
+
+          spinner.warn(`Failed to process ${patchName}: ${error.message}`);
+
+          // Abort any pending rebase
+          try {
+            await utils.execGit(
+              ["rebase", "--abort"],
+              "Failed to abort rebase"
+            );
+          } catch (e) {
+            // Ignore error if no rebase in progress
+          }
+        }
+      } catch (error) {
+        failedPatches.push({
+          name: patchName,
+          error: error.message,
+        });
+        spinner.warn(`Failed to checkout ${patchName}: ${error.message}`);
+      }
+    }
+
+    // Return to original branch
+    await utils.execGit(
+      ["checkout", originalBranch],
+      "Failed to return to original branch"
+    );
+
+    // Final status report
+    if (failedPatches.length > 0) {
+      spinner.warn("\nSome patches failed to process:");
+      failedPatches.forEach((patch) => {
+        console.log(chalk.yellow(`\n${patch.name}:`));
+        console.log(chalk.gray(`  Error: ${patch.error}`));
+      });
+    } else {
+      spinner.succeed("All patches processed successfully!");
+    }
+  } catch (error) {
+    spinner.fail(`Batch update failed: ${error.message}`);
+    throw error;
+  }
+}
+
+// Helper function to determine next version number for a patch
+async function getNextPatchVersion(patchName) {
+  try {
+    await utils.execGit(
+      ["fetch", "--all", "--tags"],
+      "Failed to fetch updates"
+    );
+
+    // Get all version tags for this patch
+    const tags = await utils.execGit(
+      ["tag", "-l", `${patchName}-v*`],
+      "Failed to list versions"
+    );
+
+    if (!tags) {
+      return "1.0.0";
+    }
+
+    // Find highest version
+    const versions = tags
+      .split("\n")
+      .map((tag) => tag.replace(`${patchName}-v`, ""))
+      .filter(Boolean)
+      .map((version) => {
+        const [major, minor, patch] = version.split(".").map(Number);
+        return { major, minor, patch, original: version };
+      })
+      .sort((a, b) => {
+        if (a.major !== b.major) return b.major - a.major;
+        if (a.minor !== b.minor) return b.minor - a.minor;
+        return b.patch - a.patch;
+      });
+
+    if (versions.length === 0) {
+      return "1.0.0";
+    }
+
+    const latest = versions[0];
+    return `${latest.major}.${latest.minor}.${latest.patch + 1}`;
+  } catch (error) {
+    console.warn(
+      `Error determining version for ${patchName}, using 1.0.0:`,
+      error.message
+    );
+    return "1.0.0";
   }
 }
 
@@ -839,13 +1188,9 @@ program
     new Command("release")
       .description("Create a new release from development branch")
       .argument("<patchName>", "name of the patch to release")
-      .option("-v, --version <version>", "version number for the release")
-      .action(async (patchName, options) => {
+      .action(async (patchName) => {
         try {
-          const version = options.version || "1.0.0";
-          const spinner = ora(
-            `Preparing release ${version} for ${patchName}\n`
-          ).start();
+          const spinner = ora(`Preparing release for ${patchName}\n`).start();
 
           try {
             const devBranch = `dev_cow_${patchName}`;
@@ -859,6 +1204,43 @@ program
               );
             }
 
+            // Get the next version number
+            spinner.text = "Determining next version number...";
+            await utils.execGit(
+              ["fetch", "--all", "--tags"],
+              "Failed to fetch updates"
+            );
+
+            // Get all version tags for this patch
+            const tags = await utils.execGit(
+              ["tag", "-l", `${patchName}-v*`],
+              "Failed to list versions"
+            );
+
+            let version = "1.0.0";
+            if (tags) {
+              const versions = tags
+                .split("\n")
+                .map((tag) => tag.replace(`${patchName}-v`, ""))
+                .filter(Boolean)
+                .map((version) => {
+                  const [major, minor, patch] = version.split(".").map(Number);
+                  return { major, minor, patch, original: version };
+                })
+                .sort((a, b) => {
+                  if (a.major !== b.major) return b.major - a.major;
+                  if (a.minor !== b.minor) return b.minor - a.minor;
+                  return b.patch - a.patch;
+                });
+
+              if (versions.length > 0) {
+                const latest = versions[0];
+                version = `${latest.major}.${latest.minor}.${latest.patch + 1}`;
+              }
+            }
+
+            spinner.text = `Preparing release v${version}...`;
+
             // Create or checkout release branch from main
             const baseBranch = await utils.getBaseBranch();
             const branches = (
@@ -868,12 +1250,16 @@ program
               .map((branch) => branch.trim().replace("* ", ""))
               .filter(Boolean);
 
-            if (!branches.includes(releaseBranch)) {
+            // If release branch exists, create a backup branch
+            if (branches.includes(releaseBranch)) {
+              const backupBranch = `${releaseBranch}_backup_v${version}`;
+              spinner.text = `Creating backup branch ${backupBranch}...`;
               await utils.execGit(
-                ["checkout", "-b", releaseBranch, baseBranch],
-                "Failed to create release branch"
+                ["branch", backupBranch, releaseBranch],
+                "Failed to create backup branch"
               );
-            } else {
+
+              // Checkout and reset release branch
               await utils.execGit(
                 ["checkout", releaseBranch],
                 "Failed to checkout release branch"
@@ -882,9 +1268,15 @@ program
                 ["reset", "--hard", baseBranch],
                 "Failed to reset release branch"
               );
+            } else {
+              await utils.execGit(
+                ["checkout", "-b", releaseBranch, baseBranch],
+                "Failed to create release branch"
+              );
             }
 
             // Squash merge all changes from dev branch
+            spinner.text = "Merging changes...";
             try {
               await utils.execGit(
                 ["merge", "--squash", devBranch],
@@ -906,6 +1298,7 @@ program
             }
 
             // Create version tag
+            spinner.text = "Creating version tag...";
             await utils.execGit(
               [
                 "tag",
@@ -918,6 +1311,7 @@ program
             );
 
             // Push changes and tags
+            spinner.text = "Pushing changes...";
             await utils.execGit(
               ["push", "-f", PATCHES_REMOTE, releaseBranch],
               "Failed to push release branch"
@@ -927,6 +1321,16 @@ program
               "Failed to push tag"
             );
 
+            // Push backup branch if it exists
+            const backupBranch = `${releaseBranch}_backup_v${version}`;
+            if (branches.includes(releaseBranch)) {
+              spinner.text = "Pushing backup branch...";
+              await utils.execGit(
+                ["push", "-f", PATCHES_REMOTE, backupBranch],
+                "Failed to push backup branch"
+              );
+            }
+
             // Return to original branch
             await utils.execGit(
               ["checkout", currentBranch],
@@ -934,7 +1338,10 @@ program
             );
 
             spinner.succeed(
-              `Successfully created release ${patchName} v${version}`
+              `Successfully created release ${patchName} v${version}` +
+                (branches.includes(releaseBranch)
+                  ? `\nBackup saved in ${backupBranch}`
+                  : "")
             );
           } catch (error) {
             spinner.fail(`Failed to create release: ${error.message}`);
@@ -945,9 +1352,24 @@ program
           process.exit(1);
         }
       })
+  )
+  .addCommand(
+    new Command("batch-update")
+      .description("Update all dev patches with latest base changes")
+      .option(
+        "-r, --auto-release",
+        "Automatically create new releases for successfully updated patches"
+      )
+      .action(async (options) => {
+        try {
+          await batchUpdateDevPatches(options);
+        } catch (e) {
+          console.error(`Batch update failed: ${e.message}`);
+          process.exit(1);
+        }
+      })
   );
 
-// Create patches subcommand group
 program
   .command("patch")
   .description("Commands for managing patches")
@@ -1147,114 +1569,6 @@ program
         }
       })
   );
-
-// First, let's add the utility function to get currently applied patches
-async function getAppliedPatches() {
-  const baseBranch = await utils.getBaseBranch();
-  const currentBranch = await utils.getCurrentBranch();
-
-  // Get all commits between base branch and current branch
-  const output = await utils.execGit(
-    ["log", `${baseBranch}..${currentBranch}`, "--pretty=format:%s"],
-    "Failed to get commit history"
-  );
-
-  // Extract patch names from commit messages
-  return output
-    .split("\n")
-    .filter(
-      (msg) =>
-        msg.startsWith("Installed cow_") || msg.startsWith("Applied cow_")
-    )
-    .map((msg) => {
-      const match = msg.match(
-        /(?:Installed|Applied) (cow_[^\s]+)(?: v(\d+\.\d+\.\d+))?/
-      );
-      if (match) {
-        return {
-          name: match[1],
-          version: match[2] || null,
-        };
-      }
-      return null;
-    })
-    .filter(Boolean)
-    .reverse(); // Reverse to get them in application order
-}
-
-async function syncPatches() {
-  const spinner = ora("Starting patch synchronization...").start();
-
-  try {
-    // Store current patches before reset
-    spinner.text = "Getting currently applied patches...";
-    const appliedPatches = await getAppliedPatches();
-
-    // Reset to base branch
-    spinner.text = "Resetting to base branch...";
-    await resetPatches();
-
-    // Reapply each patch
-    for (const patch of appliedPatches) {
-      spinner.text = `Reapplying patch ${patch.name}${
-        patch.version ? ` v${patch.version}` : ""
-      }...`;
-
-      try {
-        if (patch.version) {
-          // Version-specific installation
-          await utils.execGit(
-            ["fetch", "--all", "--tags"],
-            "Failed to fetch updates"
-          );
-
-          try {
-            await utils.execGit(
-              ["cherry-pick", `${patch.name}-v${patch.version}`],
-              "Failed to apply patch version"
-            );
-          } catch (e) {
-            spinner.warn(
-              `Conflicts detected in ${patch.name}, attempting resolution...`
-            );
-            await utils.execGit(
-              ["cherry-pick", "--abort"],
-              "Failed to abort cherry-pick"
-            );
-            await utils.execGit(
-              ["cherry-pick", "-n", `${patch.name}-v${patch.version}`],
-              "Failed to apply patch version"
-            );
-
-            await utils.handlePackageChanges();
-            await utils.execGit(["add", "."], "Failed to stage changes");
-            await utils.execGit(
-              ["commit", "-m", `Installed ${patch.name} v${patch.version}`],
-              "Failed to commit changes"
-            );
-          }
-        } else {
-          // Regular patch application
-          const cleanPatchName = patch.name.startsWith("cow_")
-            ? patch.name
-            : `cow_${patch.name}`;
-          await applyPatch(cleanPatchName);
-        }
-      } catch (e) {
-        spinner.fail(`Failed to reapply ${patch.name}: ${e.message}`);
-        throw e;
-      }
-    }
-
-    spinner.succeed("Successfully synchronized all patches");
-
-    // Show final patch list
-    await listPatches();
-  } catch (e) {
-    spinner.fail(`Sync failed: ${e.message}`);
-    throw e;
-  }
-}
 
 program
   .command("sync")
