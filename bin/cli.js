@@ -41,6 +41,98 @@ function log(message, type = "info") {
   console.log(`${prefix} ${message}`);
 }
 
+// Add this function near the top of the file, after utility functions
+
+/**
+ * Ensures the current project is valid and properly set up
+ * Checks package.json and configures remotes if needed
+ * @param {object} options - Command options
+ * @returns {boolean} - Whether the project is valid
+ */
+async function ensureValidProject(options = {}) {
+  // Skip validation for commands that don't require an existing project
+  if (options.skipValidation) {
+    return true;
+  }
+
+  try {
+    // Check if we're in a git repository
+    const isGitRepo = await fs
+      .access(".git")
+      .then(() => true)
+      .catch(() => false);
+
+    if (!isGitRepo) {
+      if (DEBUG) console.log("Not in a git repository");
+      return false;
+    }
+
+    // Check if it's a Hyperfy project by looking at package.json
+    try {
+      const packageJsonContent = await fs.readFile("package.json", "utf-8");
+      const packageData = JSON.parse(packageJsonContent);
+
+      if (packageData.name !== "hyperfy") {
+        log(
+          `Not a Hyperfy project. Package name is ${packageData.name}`,
+          "warning"
+        );
+        log("Commands may not work as expected", "warning");
+
+        // Prompt user to confirm they want to continue
+        const { proceed } = await inquirer.prompt([
+          {
+            type: "confirm",
+            name: "proceed",
+            message: "Continue anyway?",
+            default: false,
+          },
+        ]);
+
+        if (!proceed) {
+          return false;
+        }
+      }
+    } catch (error) {
+      log(`Failed to read package.json: ${error.message}`, "error");
+      return false;
+    }
+
+    // Check if the patches remote exists
+    const remotes = await utils.execGit(["remote"], "Failed to list remotes");
+    const remoteList = remotes
+      .split("\n")
+      .map((r) => r.trim())
+      .filter(Boolean);
+
+    if (!remoteList.includes(PATCHES_REMOTE)) {
+      // Remote doesn't exist, set it up
+      log(`Setting up patches remote ${PATCHES_REMOTE}...`, "info");
+      try {
+        await utils.setupPatchesRemote(
+          config.patchesRepo,
+          config.patchesRemote
+        );
+        log(`Successfully set up patches remote ${PATCHES_REMOTE}`, "success");
+      } catch (error) {
+        log(
+          `Warning: Failed to set up patches remote: ${error.message}`,
+          "warning"
+        );
+        log(
+          "Proceeding without patches remote. Some features may not work.",
+          "warning"
+        );
+      }
+    }
+
+    return true;
+  } catch (error) {
+    log(`Project validation failed: ${error.message}`, "error");
+    return false;
+  }
+}
+
 async function applyPatch(patchName) {
   const spinner = ora(`Applying mod: ${patchName}`).start();
   const appliedPatches = await utils.getAppliedPatches();
@@ -1617,6 +1709,23 @@ program.action((options, command) => {
   } else {
     console.log("ERROR: unrecognized command\n\n");
     program.help();
+  }
+});
+
+// List of commands that don't require project validation
+const commandsWithoutValidation = ["install", "extract", "bundle"];
+
+// Add a pre-action hook to validate the project before any command
+program.hook("preAction", async (thisCommand, actionCommand) => {
+  // Skip validation for certain commands
+  if (commandsWithoutValidation.includes(actionCommand.name())) {
+    return;
+  }
+
+  const isValid = await ensureValidProject();
+  if (!isValid) {
+    log("Command cannot be executed without a valid project setup", "error");
+    process.exit(1);
   }
 });
 
