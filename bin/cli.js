@@ -452,7 +452,10 @@ async function searchPatches(searchTerm = "") {
   const remoteBranches = branches
     .split("\n")
     .map((b) => b.trim())
-    .filter((b) => b.startsWith(`remotes/${PATCHES_REMOTE}/cow_`))
+    .filter(
+      (b) =>
+        b.startsWith(`remotes/${PATCHES_REMOTE}/cow_`) && !b.includes("backup")
+    )
     .map((b) => b.replace(`remotes/${PATCHES_REMOTE}/`, ""))
     .map((b) => b.replace(`cow_`, "")); // Remove package prefix
 
