@@ -42,7 +42,149 @@ function log(message, type = "info") {
 }
 
 // Add this function near the top of the file, after utility functions
+/**
+ * Validates the current branch is not a base branch, and offers alternatives if it is
+ * @returns {boolean} - Whether the current branch is valid for operations
+ */
+async function ensureNotOnBaseBranch() {
+  try {
+    const currentBranch = await utils.getCurrentBranch();
+    const baseBranch = await utils.getBaseBranch();
+    const commonBaseBranches = [
+      "main",
+      "master",
+      "dev",
+      "develop",
+      "development",
+    ];
 
+    // Check if current branch is a base branch
+    if (
+      currentBranch === baseBranch ||
+      commonBaseBranches.includes(currentBranch)
+    ) {
+      log(
+        `You are currently on ${currentBranch}, which appears to be a base branch.`,
+        "warning"
+      );
+      log(
+        "Operations should not be performed directly on base branches.",
+        "warning"
+      );
+
+      // Get list of other branches for selection
+      const branchesOutput = await utils.execGit(
+        ["branch"],
+        "Failed to list branches"
+      );
+      let branches = branchesOutput
+        .split("\n")
+        .map((b) => b.trim().replace("* ", ""))
+        .filter((b) => b && !commonBaseBranches.includes(b));
+
+      // Prepare selection menu options
+      const choices = [
+        { name: "➕ Create a new branch", value: "new" },
+        ...branches.map((b) => ({ name: b, value: b })),
+      ];
+
+      if (choices.length === 1) {
+        log(
+          "No other branches available. You need to create a new branch.",
+          "info"
+        );
+        const { newBranchName } = await inquirer.prompt([
+          {
+            type: "input",
+            name: "newBranchName",
+            message: "Enter a name for the new branch:",
+            validate: (input) => {
+              if (!input.trim()) return "Branch name cannot be empty";
+              if (input.includes(" "))
+                return "Branch name cannot contain spaces";
+              return true;
+            },
+          },
+        ]);
+
+        await createNewBranch(newBranchName, currentBranch);
+        return true;
+      }
+
+      // Show selection menu
+      const { selectedBranch } = await inquirer.prompt([
+        {
+          type: "list",
+          name: "selectedBranch",
+          message: "Select a branch to use instead:",
+          choices,
+        },
+      ]);
+
+      if (selectedBranch === "new") {
+        const { newBranchName } = await inquirer.prompt([
+          {
+            type: "input",
+            name: "newBranchName",
+            message: "Enter a name for the new branch:",
+            validate: (input) => {
+              if (!input.trim()) return "Branch name cannot be empty";
+              if (input.includes(" "))
+                return "Branch name cannot contain spaces";
+              return true;
+            },
+          },
+        ]);
+
+        await createNewBranch(newBranchName, currentBranch);
+      } else {
+        // Checkout existing branch
+        const spinner = ora(`Checking out branch ${selectedBranch}...`).start();
+        await utils.execGit(
+          ["checkout", selectedBranch],
+          "Failed to checkout selected branch"
+        );
+        spinner.succeed(`Switched to branch ${selectedBranch}`);
+      }
+
+      return true;
+    }
+
+    // Not on a base branch, all good
+    return true;
+  } catch (error) {
+    log(`Branch validation failed: ${error.message}`, "error");
+    return false;
+  }
+}
+
+/**
+ * Creates and checks out a new branch
+ * @param {string} newBranchName - Name for the new branch
+ * @param {string} baseBranch - Base branch to create from
+ */
+async function createNewBranch(newBranchName, baseBranch) {
+  const spinner = ora(
+    `Creating and checking out new branch ${newBranchName}...`
+  ).start();
+  try {
+    await utils.execGit(
+      ["checkout", "-b", newBranchName, baseBranch],
+      "Failed to create new branch"
+    );
+    spinner.succeed(`Created and switched to branch ${newBranchName}`);
+  } catch (error) {
+    spinner.fail(`Failed to create branch: ${error.message}`);
+    throw error;
+  }
+}
+
+/**
+ * Ensures the current project is valid and properly set up
+ * Checks package.json and configures remotes if needed
+ * @param {object} options - Command options
+ * @returns {boolean} - Whether the project is valid
+ */
 /**
  * Ensures the current project is valid and properly set up
  * Checks package.json and configures remotes if needed
@@ -123,6 +265,14 @@ async function ensureValidProject(options = {}) {
           "Proceeding without patches remote. Some features may not work.",
           "warning"
         );
+      }
+    }
+
+    // Validate we're not operating on a base branch
+    if (!options.skipBranchCheck) {
+      const isValidBranch = await ensureNotOnBaseBranch();
+      if (!isValidBranch) {
+        return false;
       }
     }
 
