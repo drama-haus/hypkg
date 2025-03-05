@@ -2147,13 +2147,34 @@ program
   });
 
 program
-  .command("apply <patchName>")
-  .description("Apply a specific mod")
-  .option("-v, --version <version>", "specific version to install")
-  .action(async (patchName, options) => {
+  .command("apply [patchNames...]")
+  .description("Apply one or more mods")
+  .option(
+    "-v, --version <version>",
+    "specific version to install (only for single patch)"
+  )
+  .action(async (patchNames, options) => {
     try {
-      if (options.version) {
-        // If version is specified, use install-version logic
+      // If version is specified, ensure only one patch name is provided
+      if (options.version && patchNames.length > 1) {
+        throw new Error(
+          "Version option can only be used when applying a single mod"
+        );
+      }
+
+      // If no patch names provided, show interactive selection menu
+      if (patchNames.length === 0) {
+        const selectedPatches = await promptForPatches();
+        if (selectedPatches.length === 0) {
+          log("No patches selected to apply", "info");
+          return;
+        }
+        patchNames = selectedPatches;
+      }
+
+      // For version-specific installation
+      if (patchNames.length === 1 && options.version) {
+        const patchName = patchNames[0];
         const spinner = ora(
           `Installing ${patchName} v${options.version}`
         ).start();
@@ -2204,29 +2225,82 @@ program
           throw error;
         }
       } else {
-        // Regular mod apply logic
-        const cleanPatchName = patchName.startsWith(`cow_`)
-          ? patchName
-          : `cow_${patchName}`;
-        await applyPatch(cleanPatchName);
+        // Apply each patch in sequence
+        for (const patchName of patchNames) {
+          const cleanPatchName = patchName.startsWith("cow_")
+            ? patchName
+            : `cow_${patchName}`;
+          await applyPatch(cleanPatchName);
+        }
       }
+
+      // Display the list of all applied patches
       await listPatches();
     } catch (e) {
-      console.error(`Failed to apply mod: ${e.message}`);
+      console.error(`Failed to apply mod(s): ${e.message}`);
       process.exit(1);
     }
   });
 
 program
-  .command("remove <patchName>")
-  .description("Remove a specific mod")
-  .action(async (patchName) => {
+  .command("remove [patchNames...]")
+  .description("Remove one or more mods")
+  .action(async (patchNames) => {
     try {
-      const cleanPatchName = patchName.replace(/^cow_/, "");
-      await removePatch(cleanPatchName);
+      // If no patch names provided, show interactive selection menu
+      if (patchNames.length === 0) {
+        // Get currently applied patches
+        const appliedPatches = await utils.getAppliedPatches();
+
+        if (appliedPatches.length === 0) {
+          log("No patches are currently applied", "info");
+          return;
+        }
+
+        const patchChoices = appliedPatches.map((patch) => {
+          const displayName =
+            typeof patch === "string"
+              ? patch.replace(/^cow_/, "")
+              : patch.name.replace(/^cow_/, "");
+          return {
+            name: displayName,
+            value: displayName,
+          };
+        });
+
+        const { selectedPatches } = await inquirer.prompt([
+          {
+            type: "checkbox",
+            name: "selectedPatches",
+            message: "Select patches to remove:",
+            choices: patchChoices,
+            pageSize: 10,
+            validate: (answer) => {
+              if (answer.length === 0) {
+                return "You must select at least one patch to remove.";
+              }
+              return true;
+            },
+          },
+        ]);
+
+        if (selectedPatches.length === 0) {
+          log("No patches selected to remove", "info");
+          return;
+        }
+        patchNames = selectedPatches;
+      }
+
+      // Remove each patch in sequence
+      for (const patchName of patchNames) {
+        const cleanPatchName = patchName.replace(/^cow_/, "");
+        await removePatch(cleanPatchName);
+      }
+
+      // Display the list of remaining applied patches
       await listPatches();
     } catch (e) {
-      console.error(`Failed to remove mod: ${e.message}`);
+      console.error(`Failed to remove mod(s): ${e.message}`);
       process.exit(1);
     }
   });
