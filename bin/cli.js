@@ -798,20 +798,73 @@ async function promptForPatches() {
   return selectedPatches;
 }
 
-async function promptForEnvVariables(emptyVars) {
-  const questions = emptyVars.map((varName) => ({
-    type: "input",
-    name: varName,
-    message: `Enter value for ${varName}:`,
-    validate: (input) => {
-      if (input.trim().length === 0) {
-        return `${varName} cannot be empty`;
-      }
-      return true;
-    },
-  }));
+// Modified function to detect switch-type variables in .env.example
+async function findEnvVariables(envFile) {
+  const content = await fs.readFile(envFile, "utf-8");
+  const vars = dotenv.parse(content);
 
-  const values = await inquirer.prompt(questions);
+  // Parse regular and switch-type variables
+  const variables = [];
+
+  for (const [key, value] of Object.entries(vars)) {
+    // Check if this is a switch-type variable (format: "SWITCH_TYPE=<option1|option2|option3>")
+    const switchMatch = value.match(/^<(.+)>$/);
+
+    if (switchMatch) {
+      // This is a switch type variable
+      const options = switchMatch[1].split("|").map((opt) => opt.trim());
+      variables.push({
+        key,
+        type: "switch",
+        options,
+        defaultValue: options[0],
+      });
+    } else if (value === "") {
+      // This is an empty variable that needs a value
+      variables.push({
+        key,
+        type: "input",
+        value: "",
+      });
+    }
+    // If the variable already has a value, we don't prompt for it
+  }
+
+  return variables;
+}
+
+async function promptForEnvVariables(variables) {
+  const values = {};
+  const questions = [];
+
+  for (const variable of variables) {
+    if (variable.type === "input") {
+      questions.push({
+        type: "input",
+        name: variable.key,
+        message: `Enter value for ${variable.key}:`,
+        validate: (input) => {
+          if (input.trim().length === 0) {
+            return `${variable.key} cannot be empty`;
+          }
+          return true;
+        },
+      });
+    } else if (variable.type === "switch") {
+      questions.push({
+        type: "list",
+        name: variable.key,
+        message: `Select value for ${variable.key}:`,
+        choices: variable.options,
+        default: variable.defaultValue,
+      });
+    }
+  }
+
+  if (questions.length > 0) {
+    return await inquirer.prompt(questions);
+  }
+
   return values;
 }
 
@@ -829,8 +882,16 @@ async function writeEnvFile(envFile, variables) {
   let newContent = content;
 
   for (const [key, value] of Object.entries(variables)) {
-    const regex = new RegExp(`${key}=.*`);
-    newContent = newContent.replace(regex, `${key}=${value}`);
+    // For switch types in the original file (<option1|option2>), replace with the selected value
+    // For regular empty variables, replace the empty value with the provided one
+    const switchRegex = new RegExp(`${key}=<[^>]+>`);
+    const emptyRegex = new RegExp(`${key}=.*`);
+
+    if (newContent.match(switchRegex)) {
+      newContent = newContent.replace(switchRegex, `${key}=${value}`);
+    } else {
+      newContent = newContent.replace(emptyRegex, `${key}=${value}`);
+    }
   }
 
   await fs.writeFile(".env", newContent);
@@ -843,12 +904,12 @@ async function setupEnvironment(spinner) {
     // Copy environment file
     await execa("cp", [".env.example", ".env"]);
 
-    // Find empty variables in .env.example
-    const emptyVars = await findEmptyEnvVariables(".env.example");
+    // Find variables in .env.example that need configuration
+    const variables = await findEnvVariables(".env.example");
 
-    if (emptyVars.length > 0) {
+    if (variables.length > 0) {
       spinner.info("Some environment variables need to be configured");
-      const values = await promptForEnvVariables(emptyVars);
+      const values = await promptForEnvVariables(variables);
 
       // Write the new values to .env
       await writeEnvFile(".env", values);
@@ -861,7 +922,6 @@ async function setupEnvironment(spinner) {
     console.error(e);
   }
 }
-
 async function searchPatches(searchTerm = "") {
   await utils.execGit(["remote", "update", PATCHES_REMOTE, "--prune"]);
 
