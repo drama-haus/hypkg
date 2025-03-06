@@ -166,7 +166,7 @@ async function ensureNotOnBaseBranch() {
 async function getBaseRemote() {
   try {
     // First check if origin exists
-    const remotes = await execGit(["remote"], "Failed to list remotes");
+    const remotes = await utils.execGit(["remote"], "Failed to list remotes");
     const remoteList = remotes
       .split("\n")
       .map((r) => r.trim())
@@ -181,7 +181,7 @@ async function getBaseRemote() {
     }
 
     // Check if origin is the canonical repository
-    const originUrl = await execGit(
+    const originUrl = await utils.execGit(
       ["remote", "get-url", "origin"],
       "Failed to get origin URL"
     );
@@ -221,22 +221,25 @@ async function syncBranches() {
   const baseBranch = await getBaseBranch();
 
   // Fetch latest changes from the appropriate remote
-  await execGit(
+  await utils.execGit(
     ["fetch", baseRemote],
     `Failed to fetch updates from ${baseRemote}`
   );
 
   // Reset the base branch to the remote base branch
-  await execGit(["checkout", baseBranch], "Failed to checkout base branch");
+  await utils.execGit(
+    ["checkout", baseBranch],
+    "Failed to checkout base branch"
+  );
 
-  await execGit(
+  await utils.execGit(
     ["reset", "--hard", `${baseRemote}/${baseBranch}`],
     "Failed to reset base branch"
   );
 
   // Also fetch from patches remote
   try {
-    await execGit(
+    await utils.execGit(
       ["fetch", PATCHES_REMOTE],
       `Failed to fetch updates from ${PATCHES_REMOTE}`
     );
@@ -255,10 +258,13 @@ async function ensureLatestBase() {
   const baseRemote = await getBaseRemote();
 
   // Fetch latest from appropriate remote
-  await execGit(["fetch", baseRemote], `Failed to fetch from ${baseRemote}`);
+  await utils.execGit(
+    ["fetch", baseRemote],
+    `Failed to fetch from ${baseRemote}`
+  );
 
   // Check if the base branch is behind remote
-  const behindCount = await execGit(
+  const behindCount = await utils.execGit(
     ["rev-list", "--count", `HEAD..${baseRemote}/${baseBranch}`],
     "Failed to check if base branch is behind"
   );
@@ -272,16 +278,19 @@ async function ensureLatestBase() {
     const currentBranch = await getCurrentBranch();
 
     // Update base branch
-    await execGit(["checkout", baseBranch], "Failed to checkout base branch");
+    await utils.execGit(
+      ["checkout", baseBranch],
+      "Failed to checkout base branch"
+    );
 
-    await execGit(
+    await utils.execGit(
       ["reset", "--hard", `${baseRemote}/${baseBranch}`],
       "Failed to reset base branch"
     );
 
     // Return to original branch
     if (currentBranch !== baseBranch) {
-      await execGit(
+      await utils.execGit(
         ["checkout", currentBranch],
         "Failed to return to original branch"
       );
@@ -461,6 +470,244 @@ async function ensureValidProject(options = {}) {
     return false;
   }
 }
+async function readModsMetadata() {
+  try {
+    const metadataFile = "./world/mods.json";
+
+    // Check if file exists
+    try {
+      await fs.access(metadataFile);
+    } catch (e) {
+      // File doesn't exist, return default structure
+      return {
+        patches: [],
+        baseCommitHash: null,
+        branchName: null,
+        lastUpdated: new Date().toISOString(),
+      };
+    }
+
+    // Read and parse file
+    const content = await fs.readFile(metadataFile, "utf-8");
+    return JSON.parse(content);
+  } catch (error) {
+    console.warn(`Warning: Failed to read mods metadata: ${error.message}`);
+    // Return default structure on error
+    return {
+      patches: [],
+      baseCommitHash: null,
+      branchName: null,
+      lastUpdated: new Date().toISOString(),
+    };
+  }
+}
+
+async function writeModsMetadata(metadata) {
+  try {
+    const metadataFile = "./world/mods.json";
+
+    // Update timestamp
+    metadata.lastUpdated = new Date().toISOString();
+
+    // Write the file with pretty formatting
+    await fs.writeFile(metadataFile, JSON.stringify(metadata, null, 2));
+
+    return true;
+  } catch (error) {
+    console.warn(`Warning: Failed to write mods metadata: ${error.message}`);
+    return false;
+  }
+}
+
+// Extract version from commit message if it exists
+function extractVersionFromMessage(message) {
+  const versionMatch = message.match(/v(\d+\.\d+\.\d+)/);
+  if (versionMatch) {
+    return versionMatch[1];
+  }
+  return null;
+}
+
+// This function updates the metadata for a specific patch
+async function updatePatchMetadata(
+  patchName,
+  originalCommitHash,
+  commitMessage
+) {
+  try {
+    // Read current metadata
+    const metadata = await readModsMetadata();
+
+    // Extract version from commit message if present
+    const version = extractVersionFromMessage(commitMessage);
+
+    // Update branch and base hash info if not already set
+    if (!metadata.branchName) {
+      metadata.branchName = await utils.getCurrentBranch();
+    }
+
+    if (!metadata.baseCommitHash) {
+      const baseBranch = await utils.getBaseBranch();
+      const baseRemote = await getBaseRemote();
+      metadata.baseCommitHash = await utils.execGit(
+        ["rev-parse", `${baseRemote}/${baseBranch}`],
+        "Failed to get base commit hash"
+      );
+    }
+
+    // Check if this patch already exists in metadata
+    const existingIndex = metadata.patches.findIndex(
+      (p) => p.name === patchName
+    );
+
+    if (existingIndex >= 0) {
+      // Update existing patch entry
+      metadata.patches[existingIndex] = {
+        name: patchName,
+        version: version,
+        originalCommitHash: originalCommitHash,
+        appliedAt: new Date().toISOString(),
+      };
+    } else {
+      // Add new patch entry
+      metadata.patches.push({
+        name: patchName,
+        version: version,
+        originalCommitHash: originalCommitHash,
+        appliedAt: new Date().toISOString(),
+      });
+    }
+
+    // Write updated metadata
+    await writeModsMetadata(metadata);
+    return true;
+  } catch (error) {
+    console.warn(`Warning: Failed to update patch metadata: ${error.message}`);
+    return false;
+  }
+}
+
+// Remove a patch from metadata
+async function removePatchFromMetadata(patchName) {
+  try {
+    // Read current metadata
+    const metadata = await readModsMetadata();
+
+    // Filter out the removed patch
+    metadata.patches = metadata.patches.filter((p) => p.name !== patchName);
+
+    // Write updated metadata
+    await writeModsMetadata(metadata);
+    return true;
+  } catch (error) {
+    console.warn(`Warning: Failed to update patch metadata: ${error.message}`);
+    return false;
+  }
+}
+
+async function updateModsMetadataState() {
+  const spinner = ora("Updating mods metadata...").start();
+
+  try {
+    // Read current metadata
+    const metadata = await readModsMetadata();
+
+    // Update branch name
+    metadata.branchName = await utils.getCurrentBranch();
+
+    // Update base commit hash
+    const baseBranch = await utils.getBaseBranch();
+    const baseRemote = await getBaseRemote();
+    metadata.baseCommitHash = await utils.execGit(
+      ["rev-parse", `${baseRemote}/${baseBranch}`],
+      "Failed to get base commit hash"
+    );
+
+    // Get current applied patches
+    const appliedPatches = await utils.getAppliedPatches();
+
+    // Create a temporary map of patches to preserve original commit hashes
+    const patchMap = {};
+    metadata.patches.forEach((patch) => {
+      patchMap[patch.name] = {
+        version: patch.version,
+        originalCommitHash: patch.originalCommitHash,
+        appliedAt: patch.appliedAt,
+      };
+    });
+
+    // Reset patches array
+    metadata.patches = [];
+
+    // Process each applied patch
+    for (const patch of appliedPatches) {
+      let patchName, version;
+
+      if (typeof patch === "string") {
+        patchName = patch;
+        version = null;
+      } else {
+        patchName = patch.name;
+        version = patch.version;
+      }
+
+      // Get local commit info (for commit message)
+      let commitMessage;
+      try {
+        commitMessage = await utils.execGit(
+          ["log", "-1", "--format=%B", "--grep", `^${patchName}$`],
+          `Failed to get commit message for ${patchName}`
+        );
+      } catch (e) {
+        commitMessage = "";
+      }
+
+      // Extract version from commit message if not already set
+      if (!version) {
+        version = extractVersionFromMessage(commitMessage);
+      }
+
+      // Use the original commit hash if we have it stored
+      let originalCommitHash = null;
+      if (patchMap[patchName] && patchMap[patchName].originalCommitHash) {
+        originalCommitHash = patchMap[patchName].originalCommitHash;
+      } else {
+        // If we don't have the original hash, try to get it from the remote
+        try {
+          const cleanPatchName = patchName.startsWith("cow_")
+            ? patchName
+            : `cow_${patchName}`;
+          originalCommitHash = await utils.execGit(
+            ["rev-parse", `${PATCHES_REMOTE}/${cleanPatchName}`],
+            `Failed to get original commit hash for ${patchName}`
+          );
+        } catch (e) {
+          console.warn(
+            `Warning: Could not get original commit hash for ${patchName}: ${e.message}`
+          );
+        }
+      }
+
+      metadata.patches.push({
+        name: patchName,
+        version: version,
+        originalCommitHash: originalCommitHash,
+        appliedAt: patchMap[patchName]
+          ? patchMap[patchName].appliedAt
+          : new Date().toISOString(),
+      });
+    }
+
+    // Write updated metadata
+    await writeModsMetadata(metadata);
+
+    spinner.succeed("Mods metadata updated successfully");
+    return true;
+  } catch (error) {
+    spinner.fail(`Failed to update mods metadata: ${error.message}`);
+    return false;
+  }
+}
 
 async function applyPatch(patchName) {
   const spinner = ora(`Applying mod: ${patchName}`).start();
@@ -475,6 +722,18 @@ async function applyPatch(patchName) {
 
   try {
     spinner.text = "Finding mod commit...";
+
+    // Get the original commit hash and message from the remote branch
+    const originalCommitHash = await utils.execGit(
+      ["rev-parse", `${PATCHES_REMOTE}/${patchName}`],
+      `Failed to find commit hash for mod ${patchName}`
+    );
+
+    const commitMessage = await utils.execGit(
+      ["log", "-1", "--format=%B", originalCommitHash],
+      `Failed to get commit message for mod ${patchName}`
+    );
+
     const commit = await utils.execGit(
       ["rev-list", "-n", "1", `${PATCHES_REMOTE}/${patchName}`, "^HEAD"],
       `Failed to find commit for mod ${patchName}`
@@ -499,6 +758,9 @@ async function applyPatch(patchName) {
       );
 
       spinner.succeed(`Successfully applied mod: ${patchName}`);
+
+      // Update mods metadata with original commit hash
+      await updatePatchMetadata(patchName, originalCommitHash, commitMessage);
     } catch (cherryPickError) {
       spinner.warn("Cherry-pick failed, attempting alternative approach...");
 
@@ -534,6 +796,9 @@ async function applyPatch(patchName) {
         ["commit", "-m", `cow_${patchName}`],
         "Failed to commit changes"
       );
+
+      // Update mods metadata with original commit hash
+      await updatePatchMetadata(patchName, originalCommitHash, commitMessage);
     }
   } catch (error) {
     spinner.fail(`Failed to apply mod: ${error.message}`);
@@ -623,6 +888,9 @@ async function removePatch(patchName) {
     await utils.handlePackageChanges();
 
     spinner.succeed(`Successfully removed mod: ${patchName}`);
+
+    // Remove patch from metadata
+    await removePatchFromMetadata(patchName);
   } catch (error) {
     spinner.fail(`Failed to remove mod: ${error.message}`);
     log("Rolling back to initial state...", "warning");
@@ -710,6 +978,21 @@ async function resetPatches() {
     }
 
     await utils.setupPatchesRemote(config.patchesRepo, config.patchesRemote);
+
+    // Initialize metadata with empty state
+    const baseCommitHash = await utils.execGit(
+      ["rev-parse", `${baseRemote}/${baseBranch}`],
+      "Failed to get base commit hash"
+    );
+
+    const metadata = {
+      patches: [],
+      baseCommitHash: baseCommitHash,
+      branchName: currentBranch,
+      lastUpdated: new Date().toISOString(),
+    };
+
+    await writeModsMetadata(metadata);
 
     spinner.succeed("Reset completed successfully!");
     await listPatches();
@@ -1069,6 +1352,58 @@ async function getAppliedPatches() {
     .reverse(); // Reverse to get them in application order
 }
 
+async function applyPatchWithDependencies(patchName, options = {}) {
+  const spinner = ora(`Preparing to apply mod: ${patchName}`).start();
+
+  try {
+    // Normalize patch name
+    const normalizedPatchName = patchName.startsWith("cow_")
+      ? patchName
+      : `cow_${patchName}`;
+
+    // Check if patch is already applied
+    const appliedPatches = await utils.getAppliedPatches();
+    if (
+      appliedPatches.some((patch) => {
+        const pName = typeof patch === "string" ? patch : patch.name;
+        return pName === normalizedPatchName || pName === patchName;
+      })
+    ) {
+      spinner.info(`Patch ${patchName} is already applied`);
+      return;
+    }
+
+    // Resolve all dependencies
+    spinner.text = "Resolving dependencies...";
+    const dependencies = await resolveDependencyChain(normalizedPatchName);
+
+    if (dependencies.length > 0) {
+      spinner.info(`Found ${dependencies.length} dependencies to apply first`);
+
+      // Apply each dependency if not already applied
+      for (const dependency of dependencies) {
+        const isApplied = await isPatchApplied(dependency);
+        if (!isApplied) {
+          spinner.text = `Applying dependency: ${dependency}`;
+          await applyPatch(dependency);
+        } else {
+          spinner.text = `Dependency already applied: ${dependency}`;
+        }
+      }
+    }
+
+    // Now apply the main patch
+    spinner.text = `Applying mod: ${patchName}`;
+    await applyPatch(normalizedPatchName);
+
+    spinner.succeed(`Successfully applied ${patchName} with all dependencies`);
+  } catch (error) {
+    spinner.fail(`Failed to apply patch with dependencies: ${error.message}`);
+    throw error;
+  }
+}
+
+// Enhance the syncPatches function to preserve original commit hashes
 async function syncPatches() {
   const spinner = ora("Starting mod synchronization...").start();
 
@@ -1139,6 +1474,20 @@ async function syncPatches() {
 
     const failedPatches = [];
 
+    // Read current metadata to preserve original commit hashes
+    const metadata = await readModsMetadata();
+    const patchMap = {};
+
+    if (metadata && metadata.patches) {
+      metadata.patches.forEach((patch) => {
+        patchMap[patch.name] = {
+          version: patch.version,
+          originalCommitHash: patch.originalCommitHash,
+          appliedAt: patch.appliedAt,
+        };
+      });
+    }
+
     // Store current patches before reset
     spinner.text = "Getting currently applied patches...";
     const appliedPatches = await utils.getAppliedPatches();
@@ -1161,11 +1510,34 @@ async function syncPatches() {
             "Failed to fetch updates"
           );
 
+          // Get the original commit hash for the version tag
+          let originalCommitHash;
+          try {
+            originalCommitHash = await utils.execGit(
+              ["rev-parse", `${patch.name}-v${patch.version}`],
+              "Failed to get original commit hash for version tag"
+            );
+          } catch (e) {
+            // If we can't get the tag hash, try to use the stored one
+            originalCommitHash = patchMap[patch.name]
+              ? patchMap[patch.name].originalCommitHash
+              : null;
+          }
+
           try {
             await utils.execGit(
               ["cherry-pick", `${patch.name}-v${patch.version}`],
               "Failed to apply mod version"
             );
+
+            // Update metadata with the original commit hash and version
+            if (originalCommitHash) {
+              await updatePatchMetadata(
+                patch.name,
+                originalCommitHash,
+                `${patch.name} v${patch.version}`
+              );
+            }
           } catch (e) {
             spinner.warn(
               "Cherry-pick failed, attempting alternative approach..."
@@ -1186,12 +1558,22 @@ async function syncPatches() {
               ["commit", "-m", `Installed ${patch.name} v${patch.version}`],
               "Failed to commit changes"
             );
+
+            // Update metadata with the original commit hash and version
+            if (originalCommitHash) {
+              await updatePatchMetadata(
+                patch.name,
+                originalCommitHash,
+                `${patch.name} v${patch.version}`
+              );
+            }
           }
         } else {
           // Regular mod application
           const cleanPatchName = patch.name.startsWith("cow_")
             ? patch.name
             : `cow_${patch.name}`;
+
           await applyPatch(cleanPatchName);
         }
       } catch (e) {
@@ -1211,6 +1593,9 @@ async function syncPatches() {
     } else {
       spinner.succeed("Successfully synchronized all patches");
     }
+
+    // Update mods metadata with final state
+    await updateModsMetadataState();
 
     // Show final patch list
     await listPatches();
@@ -2436,6 +2821,69 @@ program.action((options, command) => {
 
 // List of commands that don't require project validation
 const commandsWithoutValidation = ["install", "extract", "bundle"];
+
+program
+  .command("update-metadata")
+  .description("Update mods.json with current state")
+  .action(async () => {
+    try {
+      await updateModsMetadataState();
+      log("Metadata updated successfully", "success");
+    } catch (e) {
+      console.error(`Failed to update metadata: ${e.message}`);
+      process.exit(1);
+    }
+  });
+
+// Add a new command to view metadata
+program
+  .command("metadata")
+  .description("Display the current mods.json metadata")
+  .action(async () => {
+    try {
+      const metadata = await readModsMetadata();
+
+      console.log(chalk.cyan("\nCurrent Mods Metadata:"));
+      console.log(chalk.gray("Branch Name:"), metadata.branchName || "N/A");
+      console.log(
+        chalk.gray("Base Commit:"),
+        metadata.baseCommitHash
+          ? metadata.baseCommitHash.substring(0, 8)
+          : "N/A"
+      );
+      console.log(chalk.gray("Last Updated:"), metadata.lastUpdated);
+
+      if (metadata.patches && metadata.patches.length > 0) {
+        console.log(chalk.cyan("\nApplied Patches:"));
+        metadata.patches.forEach((patch) => {
+          console.log(chalk.green(`  ${patch.name.replace(/^cow_/, "")}`));
+          if (patch.version) {
+            console.log(chalk.gray(`    Version: ${patch.version}`));
+          }
+          if (patch.originalCommitHash) {
+            console.log(
+              chalk.gray(
+                `    Commit: ${patch.originalCommitHash.substring(0, 8)}`
+              )
+            );
+          }
+          console.log(
+            chalk.gray(
+              `    Applied: ${new Date(patch.appliedAt).toLocaleString()}`
+            )
+          );
+        });
+      } else {
+        console.log(chalk.yellow("\nNo patches currently applied."));
+      }
+    } catch (e) {
+      console.error(`Failed to read metadata: ${e.message}`);
+      process.exit(1);
+    }
+  });
+
+// Update command groups to include metadata management
+commandGroups.mod.commands.push("update-metadata", "metadata");
 
 // Add a pre-action hook to validate the project before any command
 program.hook("preAction", async (thisCommand, actionCommand) => {
