@@ -41,6 +41,124 @@ function log(message, type = "info") {
   console.log(`${prefix} ${message}`);
 }
 
+/**
+ * Get the associated patch name for a branch
+ * This first checks git config to see if a mapping exists,
+ * then falls back to naming conventions
+ *
+ * @param {string} branchName - Name of the branch
+ * @returns {Promise<string>} - The patch name associated with this branch
+ */
+async function getPatchNameForBranch(branchName) {
+  try {
+    // First check if there's a stored mapping in git config
+    try {
+      const configKey = `hyperfy.mod.${branchName}.patchName`;
+      const configuredPatchName = await utils.execGit(
+        ["config", "--get", configKey],
+        "Failed to get patch name from git config"
+      );
+
+      if (configuredPatchName && configuredPatchName.trim()) {
+        return configuredPatchName.trim();
+      }
+    } catch (error) {
+      // Git config not set, continue to convention-based approach
+    }
+
+    // Check for legacy naming conventions
+    if (branchName.startsWith("dev_cow_")) {
+      return branchName.replace("dev_cow_", "");
+    } else if (branchName.startsWith("cow_")) {
+      return branchName.replace("cow_", "");
+    }
+
+    // Fallback to using the branch name itself
+    return branchName;
+  } catch (error) {
+    console.warn(
+      `Warning: Failed to determine patch name from branch: ${error.message}`
+    );
+    // Return branch name as fallback
+    return branchName;
+  }
+}
+
+/**
+ * Gets the release branch name for a patch
+ *
+ * @param {string} patchName - Name of the patch
+ * @returns {string} - The release branch name (always with cow_ prefix)
+ */
+function getReleaseBranchName(patchName) {
+  // Ensure the patch name doesn't already have the prefix
+  const cleanPatchName = patchName.replace(/^cow_/, "");
+  return `cow_${cleanPatchName}`;
+}
+
+/**
+ * Determines if a branch name is a base/protected branch
+ *
+ * @param {string} branchName - Name of the branch to check
+ * @returns {Promise<boolean>} - True if this is a base/protected branch
+ */
+async function isBaseBranch(branchName) {
+  const baseBranch = await utils.getBaseBranch();
+  const commonBaseBranches = [
+    baseBranch,
+    "main",
+    "master",
+    "dev",
+    "develop",
+    "development",
+  ];
+
+  return commonBaseBranches.includes(branchName);
+}
+
+/**
+ * Get the preferred repository for a patch
+ * This simplifies the repository selection logic and can be
+ * reused across commands
+ *
+ * @param {string} patchName - Name of the patch
+ * @param {boolean} interactive - Whether to allow interactive selection
+ * @returns {Promise<string>} - The repository name to use
+ */
+async function getRepositoryForPatch(patchName, interactive = true) {
+  try {
+    // First try to get repository from git config
+    try {
+      const configKey = `hyperfy.mod.${patchName}.repository`;
+      const configuredRepo = await utils.execGit(
+        ["config", "--get", configKey],
+        "Failed to get repository from git config"
+      );
+
+      if (configuredRepo && configuredRepo.trim()) {
+        // Verify the repository exists
+        const repositories = await getRegisteredRepositories();
+        if (repositories.some((repo) => repo.name === configuredRepo.trim())) {
+          return configuredRepo.trim();
+        }
+      }
+    } catch (error) {
+      // Git config not set, continue to interactive selection or default
+    }
+
+    if (interactive) {
+      // Get repository through interactive selection
+      return await getPreferredReleaseRepository(patchName);
+    } else {
+      // Default to the patches remote
+      return PATCHES_REMOTE;
+    }
+  } catch (error) {
+    console.warn(`Warning: Failed to determine repository: ${error.message}`);
+    return PATCHES_REMOTE;
+  }
+}
+
 // Add this function near the top of the file, after utility functions
 /**
  * Validates the current branch is not a base branch, and offers alternatives if it is
@@ -199,6 +317,251 @@ async function getBaseRemote() {
       error.message
     );
     return "origin";
+  }
+}
+
+// Add these functions to manage custom repositories
+
+/**
+ * Get all registered patch repositories
+ * @returns {Promise<Array<{name: string, url: string}>>} Array of repository objects
+ */
+async function getRegisteredRepositories() {
+  try {
+    // Get all remotes from git
+    const remotes = await utils.execGit(["remote"], "Failed to list remotes");
+    const remoteList = remotes
+      .split("\n")
+      .map((r) => r.trim())
+      .filter(Boolean);
+
+    // Get URL for each remote
+    const repositories = [];
+    for (const remote of remoteList) {
+      try {
+        const url = await utils.execGit(
+          ["remote", "get-url", remote],
+          `Failed to get URL for remote ${remote}`
+        );
+        repositories.push({ name: remote, url: url.trim() });
+      } catch (error) {
+        console.warn(
+          `Warning: Could not get URL for remote ${remote}: ${error.message}`
+        );
+      }
+    }
+
+    return repositories;
+  } catch (error) {
+    console.error(`Failed to get registered repositories: ${error.message}`);
+    return [{ name: PATCHES_REMOTE, url: config.patchesRepo }];
+  }
+}
+
+/**
+ * Extract a repository name from URL
+ * @param {string} url - Repository URL
+ * @returns {string} - Suggested repository name
+ */
+function extractRepoNameFromUrl(url) {
+  try {
+    // Handle GitHub URLs
+    const githubMatch = url.match(/github\.com\/([^\/]+)/);
+    if (githubMatch) {
+      return githubMatch[1];
+    }
+
+    // Handle GitLab URLs
+    const gitlabMatch = url.match(/gitlab\.com\/([^\/]+)/);
+    if (gitlabMatch) {
+      return gitlabMatch[1];
+    }
+
+    // Handle Bitbucket URLs
+    const bitbucketMatch = url.match(/bitbucket\.org\/([^\/]+)/);
+    if (bitbucketMatch) {
+      return bitbucketMatch[1];
+    }
+
+    // Generic git URLs with format username@host:path/repo.git
+    const sshMatch = url.match(/@([^:]+):([^\/]+)/);
+    if (sshMatch) {
+      return sshMatch[2];
+    }
+
+    // If no specific pattern matches, extract domain name without TLD
+    const domainMatch = url.match(/\/\/([^\/]+)/);
+    if (domainMatch) {
+      const domain = domainMatch[1].split(".")[0];
+      return domain !== "www"
+        ? domain
+        : url.split("/").pop().replace(".git", "");
+    }
+
+    // Fallback: use the last part of the URL
+    return url.split("/").pop().replace(".git", "");
+  } catch (error) {
+    // If anything goes wrong, return a generic name
+    return "custom-repo";
+  }
+}
+
+/**
+ * Add a new patch repository
+ * @param {string} nameOrUrl - The name for the remote or the URL (name will be derived)
+ * @param {string} [url] - The URL of the repository (optional if first param is URL)
+ * @returns {Promise<boolean>} Success status
+ */
+async function addRepository(nameOrUrl, url) {
+  try {
+    let repoName, repoUrl;
+
+    // Check if only one parameter was provided (URL)
+    if (!url) {
+      repoUrl = nameOrUrl;
+      repoName = extractRepoNameFromUrl(repoUrl);
+    } else {
+      repoName = nameOrUrl;
+      repoUrl = url;
+    }
+
+    // Validate name format
+    if (!repoName.match(/^[a-zA-Z0-9_-]+$/)) {
+      throw new Error(
+        "Repository name must contain only letters, numbers, underscore, and hyphen"
+      );
+    }
+
+    // Check if remote already exists
+    const remotes = await utils.execGit(["remote"], "Failed to list remotes");
+    const remoteList = remotes
+      .split("\n")
+      .map((r) => r.trim())
+      .filter(Boolean);
+
+    if (remoteList.includes(repoName)) {
+      // Ask if the user wants to use a different name
+      const { useNewName } = await inquirer.prompt([
+        {
+          type: "confirm",
+          name: "useNewName",
+          message: `Remote ${repoName} already exists. Would you like to use a different name?`,
+          default: true,
+        },
+      ]);
+
+      if (useNewName) {
+        const { newName } = await inquirer.prompt([
+          {
+            type: "input",
+            name: "newName",
+            message: "Enter a new name for the repository:",
+            validate: (input) => {
+              if (!input.trim()) return "Repository name cannot be empty";
+              if (!input.match(/^[a-zA-Z0-9_-]+$/))
+                return "Repository name must contain only letters, numbers, underscore, and hyphen";
+              if (remoteList.includes(input.trim()))
+                return `Remote ${input.trim()} already exists`;
+              return true;
+            },
+          },
+        ]);
+        repoName = newName.trim();
+      } else {
+        throw new Error(
+          `Remote ${repoName} already exists and no new name was provided`
+        );
+      }
+    }
+
+    log(`Adding repository '${repoName}' with URL: ${repoUrl}`, "info");
+
+    // Add the remote
+    await utils.execGit(
+      ["remote", "add", repoName, repoUrl],
+      `Failed to add remote ${repoName}`
+    );
+
+    // Fetch from the new remote
+    const spinner = ora(`Fetching from new repository ${repoName}...`).start();
+    try {
+      await utils.execGit(
+        ["fetch", repoName],
+        `Failed to fetch from ${repoName}`
+      );
+      spinner.succeed(`Successfully fetched from ${repoName}`);
+    } catch (error) {
+      spinner.fail(
+        `Warning: Failed to fetch from ${repoName}: ${error.message}`
+      );
+      console.warn(
+        "The remote was added but initial fetch failed. The repository may be inaccessible."
+      );
+    }
+
+    return { success: true, name: repoName };
+  } catch (error) {
+    console.error(`Failed to add repository: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Remove a patch repository
+ * @param {string} name - The name of the remote to remove
+ * @returns {Promise<boolean>} Success status
+ */
+async function removeRepository(name) {
+  try {
+    // Don't allow removing the default patches remote
+    if (name === PATCHES_REMOTE) {
+      throw new Error(
+        `Cannot remove the default patches remote ${PATCHES_REMOTE}`
+      );
+    }
+
+    // Check if remote exists
+    const remotes = await utils.execGit(["remote"], "Failed to list remotes");
+    const remoteList = remotes
+      .split("\n")
+      .map((r) => r.trim())
+      .filter(Boolean);
+
+    if (!remoteList.includes(name)) {
+      throw new Error(`Remote ${name} does not exist`);
+    }
+
+    // Remove the remote
+    await utils.execGit(
+      ["remote", "remove", name],
+      `Failed to remove remote ${name}`
+    );
+
+    return true;
+  } catch (error) {
+    console.error(`Failed to remove repository: ${error.message}`);
+    return false;
+  }
+}
+
+/**
+ * List all registered patch repositories
+ */
+async function listRepositories() {
+  try {
+    const repositories = await getRegisteredRepositories();
+
+    console.log("\nRegistered patch repositories:");
+    if (repositories.length === 0) {
+      console.log("  No repositories registered");
+    } else {
+      repositories.forEach((repo) => {
+        const isDefault = repo.name === PATCHES_REMOTE ? " (default)" : "";
+        console.log(`  - ${repo.name}${isDefault}: ${repo.url}`);
+      });
+    }
+  } catch (error) {
+    console.error(`Failed to list repositories: ${error.message}`);
   }
 }
 
@@ -528,11 +891,184 @@ function extractVersionFromMessage(message) {
   return null;
 }
 
-// This function updates the metadata for a specific patch
+/**
+ * Apply a patch from a specific repository
+ * @param {string} patchName - Name of the patch
+ * @param {string} remoteName - Name of the remote
+ * @returns {Promise<void>}
+ */
+async function applyPatchFromRepo(patchName, remoteName) {
+  const spinner = ora(`Applying mod: ${patchName} from ${remoteName}`).start();
+  const appliedPatches = await utils.getAppliedPatches();
+
+  // Check if patch is already applied (considering namespace)
+  const namespacedPatchName = `${remoteName}/${patchName.replace(/^cow_/, "")}`;
+  if (
+    appliedPatches.some((p) => {
+      const name = typeof p === "string" ? p : p.name;
+      return name === patchName || name === namespacedPatchName;
+    })
+  ) {
+    spinner.info(`Patch ${namespacedPatchName} is already applied`);
+    return;
+  }
+
+  const initialState = await utils.saveGitState();
+
+  try {
+    spinner.text = "Finding mod commit...";
+
+    // Format the branch name correctly for this remote
+    const remoteBranchName = patchName.startsWith("cow_")
+      ? patchName
+      : `cow_${patchName}`;
+
+    // Get the original commit hash and message from the remote branch
+    const originalCommitHash = await utils.execGit(
+      ["rev-parse", `${remoteName}/${remoteBranchName}`],
+      `Failed to find commit hash for mod ${patchName} from ${remoteName}`
+    );
+
+    const commitMessage = await utils.execGit(
+      ["log", "-1", "--format=%B", originalCommitHash],
+      `Failed to get commit message for mod ${patchName} from ${remoteName}`
+    );
+
+    const commit = await utils.execGit(
+      ["rev-list", "-n", "1", `${remoteName}/${remoteBranchName}`, "^HEAD"],
+      `Failed to find commit for mod ${patchName} from ${remoteName}`
+    );
+
+    if (!commit) {
+      spinner.fail(
+        `No unique commits found in ${patchName} from ${remoteName}`
+      );
+      throw new Error(
+        `No unique commits found in ${patchName} from ${remoteName}`
+      );
+    }
+
+    try {
+      spinner.text = "Applying mod changes...";
+      await utils.execGit(
+        ["cherry-pick", commit],
+        "Failed to cherry-pick commit"
+      );
+
+      // Update commit message to track mod with namespace
+      await utils.execGit(
+        ["commit", "--amend", "-m", `${namespacedPatchName}`],
+        "Failed to update commit message"
+      );
+
+      spinner.succeed(`Successfully applied mod: ${namespacedPatchName}`);
+
+      // Update mods metadata with original commit hash and remote info
+      await updatePatchMetadata(
+        namespacedPatchName,
+        originalCommitHash,
+        commitMessage,
+        remoteName
+      );
+    } catch (cherryPickError) {
+      spinner.warn("Cherry-pick failed, attempting alternative approach...");
+
+      await utils.execGit(
+        ["cherry-pick", "--abort"],
+        "Failed to abort cherry-pick"
+      );
+      await utils.execGit(
+        ["cherry-pick", "-n", commit],
+        "Failed to cherry-pick commit"
+      );
+
+      spinner.text = "Handling package dependencies...";
+      const handledLockConflict = await utils.handlePackageChanges();
+
+      if (!handledLockConflict) {
+        const hasOtherConflicts = await utils.execGit(
+          ["diff", "--name-only", "--diff-filter=U"],
+          "Failed to check conflicts"
+        );
+
+        if (hasOtherConflicts) {
+          spinner.fail("Merge conflicts detected");
+          throw new Error(
+            "Merge conflicts detected in files other than package-lock.json"
+          );
+        }
+      }
+
+      spinner.text = "Committing changes...";
+      await utils.execGit(["add", "."], "Failed to stage changes");
+      await utils.execGit(
+        ["commit", "-m", `${namespacedPatchName}`],
+        "Failed to commit changes"
+      );
+
+      // Update mods metadata with original commit hash and remote info
+      await updatePatchMetadata(
+        namespacedPatchName,
+        originalCommitHash,
+        commitMessage,
+        remoteName
+      );
+    }
+  } catch (error) {
+    spinner.fail(`Failed to apply mod: ${error.message}`);
+    log("Rolling back to initial state...", "warning");
+    await utils.restoreGitState(initialState);
+    throw error;
+  }
+}
+
+/**
+ * Parse a patch name that might include a repository prefix
+ * @param {string} fullPatchName - The full patch name, possibly with repo prefix
+ * @returns {Object} Object with remote and patchName
+ */
+async function parsePatchName(fullPatchName) {
+  // Check if the name includes a repository prefix
+  const parts = fullPatchName.split("/");
+
+  if (parts.length === 1) {
+    // No repository prefix, use default
+    return {
+      remote: PATCHES_REMOTE,
+      patchName: fullPatchName,
+    };
+  }
+
+  // Verify the remote exists
+  const repositories = await getRegisteredRepositories();
+  const remoteName = parts[0];
+  const repoExists = repositories.some((repo) => repo.name === remoteName);
+
+  if (!repoExists) {
+    throw new Error(
+      `Repository '${remoteName}' is not registered. Use 'repository add' to add it first.`
+    );
+  }
+
+  return {
+    remote: remoteName,
+    patchName: parts.slice(1).join("/"),
+  };
+}
+
+/**
+ * Update metadata for a patch, including remote information
+ * @param {string} patchName - Name of the patch
+ * @param {string} originalCommitHash - Original commit hash
+ * @param {string} commitMessage - Commit message
+ * @param {string} remoteName - Name of the remote
+ * @returns {Promise<boolean>} Success status
+ */
 async function updatePatchMetadata(
   patchName,
   originalCommitHash,
-  commitMessage
+  commitMessage,
+  remoteName
 ) {
   try {
     // Read current metadata
@@ -560,22 +1096,20 @@ async function updatePatchMetadata(
       (p) => p.name === patchName
     );
 
+    const patchMetadata = {
+      name: patchName,
+      version: version,
+      originalCommitHash: originalCommitHash,
+      appliedAt: new Date().toISOString(),
+      remote: remoteName,
+    };
+
     if (existingIndex >= 0) {
       // Update existing patch entry
-      metadata.patches[existingIndex] = {
-        name: patchName,
-        version: version,
-        originalCommitHash: originalCommitHash,
-        appliedAt: new Date().toISOString(),
-      };
+      metadata.patches[existingIndex] = patchMetadata;
     } else {
       // Add new patch entry
-      metadata.patches.push({
-        name: patchName,
-        version: version,
-        originalCommitHash: originalCommitHash,
-        appliedAt: new Date().toISOString(),
-      });
+      metadata.patches.push(patchMetadata);
     }
 
     // Write updated metadata
@@ -898,18 +1432,69 @@ async function removePatch(patchName) {
     throw error;
   }
 }
-
+/**
+ * List all applied patches with their repository information
+ */
 async function listPatches() {
   const appliedPatches = await utils.getAppliedPatches();
+  const metadata = await readModsMetadata();
 
   console.log("\nCurrently applied patches:");
   if (appliedPatches.length === 0) {
     console.log("  No patches applied");
   } else {
     for (const patch of appliedPatches) {
-      const displayName = patch.replace(`cow_`, "");
-      const { author, relativeTime } = await getPatchInfo(displayName);
-      console.log(`  - ${displayName} (by ${author}, ${relativeTime})`);
+      let displayName, remoteName;
+
+      // Try to extract patch name and remote from stored metadata
+      if (metadata && metadata.patches) {
+        const patchName = typeof patch === "string" ? patch : patch.name;
+        const metadataPatch = metadata.patches.find(
+          (p) => p.name === patchName
+        );
+
+        if (metadataPatch && metadataPatch.remote) {
+          remoteName = metadataPatch.remote;
+          displayName = patchName.replace(`cow_`, "");
+        } else {
+          // If no remote info in metadata, assume default and extract any namespace
+          const parts = patchName.replace(`cow_`, "").split("/");
+          if (parts.length > 1) {
+            remoteName = parts[0];
+            displayName = parts.slice(1).join("/");
+          } else {
+            remoteName = PATCHES_REMOTE;
+            displayName = patchName.replace(`cow_`, "");
+          }
+        }
+      } else {
+        // Fallback if no metadata is available
+        const patchName = typeof patch === "string" ? patch : patch.name;
+        const parts = patchName.replace(`cow_`, "").split("/");
+        if (parts.length > 1) {
+          remoteName = parts[0];
+          displayName = parts.slice(1).join("/");
+        } else {
+          remoteName = PATCHES_REMOTE;
+          displayName = patchName.replace(`cow_`, "");
+        }
+      }
+
+      // Show repository prefix only if it's not the default
+      const nameWithRepo =
+        remoteName !== PATCHES_REMOTE
+          ? `${remoteName}/${displayName}`
+          : displayName;
+
+      try {
+        const { author, relativeTime } = await getPatchInfo(
+          displayName,
+          remoteName
+        );
+        console.log(`  - ${nameWithRepo} (by ${author}, ${relativeTime})`);
+      } catch (error) {
+        console.log(`  - ${nameWithRepo}`);
+      }
     }
   }
 }
@@ -1205,28 +1790,56 @@ async function setupEnvironment(spinner) {
     console.error(e);
   }
 }
+
+/**
+ * Search for patches across all registered repositories
+ * @param {string} searchTerm - Optional search term to filter patches
+ * @returns {Promise<Array<{name: string, remote: string}>>} Array of patch objects with remote info
+ */
 async function searchPatches(searchTerm = "") {
-  await utils.execGit(["remote", "update", PATCHES_REMOTE, "--prune"]);
+  // Get all registered repositories
+  const repositories = await getRegisteredRepositories();
+  const results = [];
 
-  const branches = await utils.execGit(
-    ["branch", "-a"],
-    "Failed to list all branches"
-  );
+  for (const repo of repositories) {
+    try {
+      // Update the remote
+      await utils.execGit(["remote", "update", repo.name, "--prune"]);
 
-  const remoteBranches = branches
-    .split("\n")
-    .map((b) => b.trim())
-    .filter(
-      (b) =>
-        b.startsWith(`remotes/${PATCHES_REMOTE}/cow_`) && !b.includes("backup")
-    )
-    .map((b) => b.replace(`remotes/${PATCHES_REMOTE}/`, ""))
-    .map((b) => b.replace(`cow_`, "")); // Remove package prefix
+      // Get branches from this remote
+      const branches = await utils.execGit(
+        ["branch", "-a"],
+        `Failed to list branches from ${repo.name}`
+      );
 
-  if (searchTerm) {
-    return remoteBranches.filter((b) => b.includes(searchTerm));
+      // Filter remote branches that follow the patch pattern (cow_*)
+      const remoteBranches = branches
+        .split("\n")
+        .map((b) => b.trim())
+        .filter(
+          (b) =>
+            b.startsWith(`remotes/${repo.name}/cow_`) && !b.includes("backup")
+        )
+        .map((b) => b.replace(`remotes/${repo.name}/`, ""))
+        .map((b) => b.replace(`cow_`, "")); // Remove package prefix
+
+      // Add to results with remote info
+      remoteBranches.forEach((branch) => {
+        if (!searchTerm || branch.includes(searchTerm)) {
+          results.push({
+            name: branch,
+            remote: repo.name,
+          });
+        }
+      });
+    } catch (error) {
+      console.warn(
+        `Warning: Failed to search in repository ${repo.name}: ${error.message}`
+      );
+    }
   }
-  return remoteBranches;
+
+  return results;
 }
 
 function getRelativeTime(timestamp) {
@@ -1248,20 +1861,36 @@ function getRelativeTime(timestamp) {
   return `${seconds}s ago`;
 }
 
-async function getPatchInfo(branchName) {
-  const fullBranchName = `${PATCHES_REMOTE}/cow_${branchName}`;
-  const commitInfo = await utils.execGit(
-    ["log", "-1", "--format=%an|%at", fullBranchName],
-    `Failed to get commit info for ${branchName}`
-  );
+/**
+ * Get information about a patch
+ * @param {string} branchName - Name of the patch
+ * @param {string} remoteName - Name of the remote
+ * @returns {Promise<{author: string, relativeTime: string}>} Patch info
+ */
+async function getPatchInfo(branchName, remoteName) {
+  const fullBranchName = `${remoteName}/cow_${branchName}`;
+  try {
+    const commitInfo = await utils.execGit(
+      ["log", "-1", "--format=%an|%at", fullBranchName],
+      `Failed to get commit info for ${branchName} from ${remoteName}`
+    );
 
-  const [author, timestamp] = commitInfo.split("|");
-  const relativeTime = getRelativeTime(parseInt(timestamp) * 1000);
+    const [author, timestamp] = commitInfo.split("|");
+    const relativeTime = getRelativeTime(parseInt(timestamp) * 1000);
 
-  return {
-    author,
-    relativeTime,
-  };
+    return {
+      author,
+      relativeTime,
+    };
+  } catch (error) {
+    console.warn(
+      `Warning: Could not get info for ${branchName} from ${remoteName}: ${error.message}`
+    );
+    return {
+      author: "Unknown",
+      relativeTime: "Unknown",
+    };
+  }
 }
 
 // Convert Uint8Array to string
@@ -1403,7 +2032,6 @@ async function applyPatchWithDependencies(patchName, options = {}) {
   }
 }
 
-// Enhance the syncPatches function to preserve original commit hashes
 async function syncPatches() {
   const spinner = ora("Starting mod synchronization...").start();
 
@@ -1962,6 +2590,632 @@ async function updateDevPatch(patchName, options = {}) {
   }
 }
 
+/**
+ * Get the preferred repository for releasing a mod
+ * First checks git config, then falls back to interactive selection
+ * @param {string} patchName - Name of the patch
+ * @returns {Promise<string>} Repository name
+ */
+async function getPreferredReleaseRepository(patchName) {
+  try {
+    // First try to get repository from git config
+    try {
+      const configKey = `hyperfy.mod.${patchName}.repository`;
+      const configuredRepo = await utils.execGit(
+        ["config", "--get", configKey],
+        "Failed to get repository from git config"
+      );
+
+      if (configuredRepo) {
+        // Verify the repository exists
+        const repositories = await getRegisteredRepositories();
+        if (repositories.some((repo) => repo.name === configuredRepo.trim())) {
+          return configuredRepo.trim();
+        }
+      }
+    } catch (error) {
+      // Git config not set, continue to interactive selection
+    }
+
+    // Fall back to interactive selection
+    const repositories = await getRegisteredRepositories();
+
+    if (repositories.length === 1) {
+      // If only one repository is available, use it
+      return repositories[0].name;
+    }
+
+    // Prompt user to select a repository
+    const { selectedRepo } = await inquirer.prompt([
+      {
+        type: "list",
+        name: "selectedRepo",
+        message: `Select repository to release ${patchName} to:`,
+        choices: repositories.map((repo) => ({
+          name: `${repo.name}${
+            repo.name === PATCHES_REMOTE ? " (default)" : ""
+          }: ${repo.url}`,
+          value: repo.name,
+        })),
+        default: PATCHES_REMOTE,
+      },
+    ]);
+
+    // Prompt if they want to save this choice for future releases
+    const { saveChoice } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "saveChoice",
+        message: `Do you want to save ${selectedRepo} as the default repository for this mod?`,
+        default: true,
+      },
+    ]);
+
+    if (saveChoice) {
+      // Save choice in git config
+      const configKey = `hyperfy.mod.${patchName}.repository`;
+      await utils.execGit(
+        ["config", configKey, selectedRepo],
+        "Failed to save repository preference"
+      );
+      log(
+        `Saved ${selectedRepo} as the default repository for ${patchName}`,
+        "info"
+      );
+    }
+
+    return selectedRepo;
+  } catch (error) {
+    log(
+      `Failed to determine repository, using default: ${error.message}`,
+      "warning"
+    );
+    return PATCHES_REMOTE;
+  }
+}
+
+/**
+ * Release a mod to a specified repository
+ * @param {string} patchName - Name of the patch
+ * @param {string} repoName - Name of the target repository
+ * @param {Object} existingSpinner - Optional existing spinner for UI
+ * @returns {Promise<Object>} Result with success status and version
+ */
+async function releaseModToRepository(patchName, repoName, existingSpinner) {
+  const spinner =
+    existingSpinner ||
+    ora(`Preparing release for ${patchName} to ${repoName}`).start();
+
+  try {
+    // Format branch names
+    const releaseBranch = `cow_${patchName}`;
+
+    // Get the next version number
+    spinner.text = "Determining next version number...";
+    await utils.execGit(
+      ["fetch", "--all", "--tags"],
+      "Failed to fetch updates"
+    );
+
+    // Get all version tags for this mod
+    const tags = await utils.execGit(
+      ["tag", "-l", `${patchName}-v*`],
+      "Failed to list versions"
+    );
+
+    let version = "1.0.0";
+    if (tags) {
+      const versions = tags
+        .split("\n")
+        .map((tag) => tag.replace(`${patchName}-v`, ""))
+        .filter(Boolean)
+        .map((version) => {
+          const [major, minor, patch] = version.split(".").map(Number);
+          return { major, minor, patch, original: version };
+        })
+        .sort((a, b) => {
+          if (a.major !== b.major) return b.major - a.major;
+          if (a.minor !== b.minor) return b.minor - a.minor;
+          return b.patch - a.patch;
+        });
+
+      if (versions.length > 0) {
+        const latest = versions[0];
+        version = `${latest.major}.${latest.minor}.${latest.patch + 1}`;
+      }
+    }
+
+    spinner.text = `Preparing release v${version} to ${repoName}...`;
+
+    // Get the current branch - this is our development branch
+    const currentBranch = await utils.getCurrentBranch();
+
+    // Remember the current state
+    const initialState = await utils.saveGitState();
+
+    // Create or update the release branch
+    const branches = (
+      await utils.execGit(["branch"], "Failed to list branches")
+    )
+      .split("\n")
+      .map((branch) => branch.trim().replace("* ", ""))
+      .filter(Boolean);
+
+    // If release branch exists, create a backup branch
+    if (branches.includes(releaseBranch)) {
+      const backupBranch = `${releaseBranch}_backup_v${version}`;
+      spinner.text = `Creating backup branch ${backupBranch}...`;
+      await utils.execGit(
+        ["branch", backupBranch, releaseBranch],
+        "Failed to create backup branch"
+      );
+    }
+
+    // Get base branch for clean slate
+    const baseBranch = await utils.getBaseBranch();
+
+    // Create/reset release branch from base
+    if (branches.includes(releaseBranch)) {
+      // Checkout and reset release branch
+      await utils.execGit(
+        ["checkout", releaseBranch],
+        "Failed to checkout release branch"
+      );
+      await utils.execGit(
+        ["reset", "--hard", baseBranch],
+        "Failed to reset release branch"
+      );
+    } else {
+      await utils.execGit(
+        ["checkout", "-b", releaseBranch, baseBranch],
+        "Failed to create release branch"
+      );
+    }
+
+    // Squash merge all changes from development branch
+    spinner.text = "Merging changes...";
+    try {
+      await utils.execGit(
+        ["merge", "--squash", currentBranch],
+        "Failed to merge dev changes"
+      );
+      await utils.execGit(
+        ["commit", "-m", `${patchName} v${version}`],
+        "Failed to commit release"
+      );
+    } catch (e) {
+      // Handle conflicts
+      spinner.warn("Conflicts detected, attempting resolution...");
+      await utils.handlePackageChanges();
+      await utils.execGit(["add", "."], "Failed to stage changes");
+      await utils.execGit(
+        ["commit", "-m", `${patchName} v${version}`],
+        "Failed to commit release"
+      );
+    }
+
+    // Create version tag
+    spinner.text = "Creating version tag...";
+    await utils.execGit(
+      [
+        "tag",
+        "-a",
+        `${patchName}-v${version}`,
+        "-m",
+        `${patchName} version ${version}`,
+      ],
+      "Failed to create version tag"
+    );
+
+    // Push changes and tags to the specified repository
+    spinner.text = `Pushing changes to ${repoName}...`;
+    await utils.execGit(
+      ["push", "-f", repoName, releaseBranch],
+      "Failed to push release branch"
+    );
+    await utils.execGit(
+      ["push", repoName, `${patchName}-v${version}`],
+      "Failed to push tag"
+    );
+
+    // Push backup branch if it exists
+    const backupBranch = `${releaseBranch}_backup_v${version}`;
+    if (branches.includes(releaseBranch)) {
+      spinner.text = "Pushing backup branch...";
+      await utils.execGit(
+        ["push", "-f", repoName, backupBranch],
+        "Failed to push backup branch"
+      );
+    }
+
+    // Return to original branch
+    await utils.execGit(
+      ["checkout", currentBranch],
+      "Failed to return to original branch"
+    );
+
+    spinner.succeed(
+      `Successfully created release ${patchName} v${version} in ${repoName}` +
+        (branches.includes(releaseBranch)
+          ? `\nBackup saved in ${backupBranch}`
+          : "")
+    );
+
+    // Store metadata about the release
+    try {
+      // Save release repository in git config for future releases
+      const configKey = `hyperfy.mod.${patchName}.repository`;
+      await utils.execGit(
+        ["config", configKey, repoName],
+        "Failed to save repository preference"
+      );
+    } catch (error) {
+      spinner.warn(
+        `Note: Failed to save repository preference: ${error.message}`
+      );
+    }
+
+    return { success: true, version, repository: repoName };
+  } catch (error) {
+    spinner.fail(`Failed to create release: ${error.message}`);
+    throw error;
+  }
+}
+
+/**
+ * Updates a development branch with the latest base changes
+ * This function works with any branch naming convention
+ *
+ * @param {string} branchName - Name of the branch to update
+ * @param {object} options - Command options
+ * @returns {Promise<object>} - Result with success status and change information
+ */
+async function updateBranch(branchName, options = {}) {
+  const spinner = ora(`Updating ${branchName}...`).start();
+  let changesStashed = false;
+
+  try {
+    // Get the patch name associated with this branch
+    const patchName = await getPatchNameForBranch(branchName);
+    spinner.text = `Updating branch ${branchName} for patch ${patchName}...`;
+
+    const baseBranch = await utils.getBaseBranch();
+    const baseRemote = await getBaseRemote();
+    const currentBranch = await utils.getCurrentBranch();
+
+    // Verify we're on the target branch
+    if (currentBranch !== branchName) {
+      spinner.text = `Switching to branch ${branchName}...`;
+      await utils.execGit(
+        ["checkout", branchName],
+        `Failed to checkout branch ${branchName}`
+      );
+    }
+
+    // Stash any uncommitted changes
+    spinner.text = "Checking for uncommitted changes...";
+    changesStashed = await stashChanges();
+    if (changesStashed) {
+      spinner.info("Uncommitted changes stashed");
+    }
+
+    // Fetch latest changes from the appropriate remote
+    spinner.text = `Fetching latest changes from ${baseRemote}...`;
+    await utils.execGit(
+      ["fetch", baseRemote],
+      `Failed to fetch updates from ${baseRemote}`
+    );
+
+    // Attempt to rebase on the appropriate remote base branch
+    spinner.text = `Rebasing on ${baseRemote}/${baseBranch}...`;
+    let hadConflicts = false;
+    try {
+      await utils.execGit(
+        ["rebase", `${baseRemote}/${baseBranch}`],
+        "Failed to rebase on base branch"
+      );
+    } catch (e) {
+      // Handle rebase conflicts
+      spinner.warn(
+        "Conflicts detected during rebase, attempting resolution..."
+      );
+      hadConflicts = true;
+      const hasLockConflict = await utils.handlePackageChanges();
+
+      if (!hasLockConflict) {
+        const hasOtherConflicts = await utils.execGit(
+          ["diff", "--name-only", "--diff-filter=U"],
+          "Failed to check conflicts"
+        );
+
+        if (hasOtherConflicts) {
+          spinner.fail("Unresolved conflicts detected");
+
+          // Try to abort the rebase
+          try {
+            await utils.execGit(
+              ["rebase", "--abort"],
+              "Failed to abort rebase"
+            );
+          } catch (abortError) {
+            // Ignore errors if no rebase is in progress
+          }
+
+          // Restore stashed changes
+          if (changesStashed) {
+            await popStashedChanges(changesStashed);
+          }
+
+          throw new Error(
+            "Please resolve conflicts manually and continue rebase"
+          );
+        }
+      }
+
+      await utils.execGit(
+        ["rebase", "--continue"],
+        "Failed to continue rebase"
+      );
+    }
+
+    // Check if there are significant changes
+    spinner.text = "Analyzing changes...";
+    const hasChanges = hadConflicts || (await hasSignificantChanges());
+
+    spinner.succeed(
+      `Successfully updated ${branchName} from ${baseRemote}/${baseBranch}`
+    );
+
+    // Handle interactive mode or auto-release based on whether there are changes
+    if (!options.nonInteractive && !options.autoRelease) {
+      spinner.stop(); // Stop spinner during interactive prompts
+      const action = await promptForAction(patchName, hasChanges);
+
+      if (action === "release") {
+        // Release the updated patch
+        await releaseBranch(branchName, patchName, { spinner });
+      }
+    } else if (options.autoRelease && hasChanges) {
+      // Auto-release only if there were significant changes
+      spinner.info("Significant changes detected, creating new release...");
+      await releaseBranch(branchName, patchName, { spinner });
+    } else if (options.autoRelease && !hasChanges) {
+      spinner.info("No significant changes detected, skipping release");
+    }
+
+    // Restore stashed changes if any
+    if (changesStashed) {
+      spinner.text = "Restoring stashed changes...";
+      await popStashedChanges(changesStashed);
+      spinner.succeed("Stashed changes restored");
+    }
+
+    return {
+      success: true,
+      hadChanges: hasChanges,
+      patchName: patchName,
+    };
+  } catch (error) {
+    spinner.fail(`Update failed: ${error.message}`);
+
+    // Abort any pending rebase
+    try {
+      await utils.execGit(["rebase", "--abort"], "Failed to abort rebase");
+    } catch (e) {
+      // Ignore error if no rebase in progress
+    }
+
+    // Restore stashed changes if any
+    if (changesStashed) {
+      spinner.text = "Restoring stashed changes...";
+      await popStashedChanges(changesStashed);
+      spinner.info("Stashed changes restored");
+    }
+
+    throw error;
+  }
+}
+
+/**
+ * Create a release from any branch
+ *
+ * @param {string} sourceBranch - Source branch to release from
+ * @param {string} patchName - Name of the patch (optional, will be determined if not provided)
+ * @param {object} options - Additional options
+ * @returns {Promise<object>} - Result with success status and version
+ */
+async function releaseBranch(sourceBranch, patchName = null, options = {}) {
+  // Use existing spinner or create a new one
+  const spinner =
+    options.spinner || ora(`Preparing release from ${sourceBranch}...`).start();
+
+  try {
+    // Get the patch name if not provided
+    if (!patchName) {
+      patchName = await getPatchNameForBranch(sourceBranch);
+    }
+
+    // Get target repository
+    spinner.text = `Determining target repository for ${patchName}...`;
+    let targetRepo;
+
+    if (options.repository) {
+      targetRepo = options.repository;
+    } else {
+      // If we can't do interactive selection, use stored preference or default
+      if (options.nonInteractive) {
+        targetRepo = await getRepositoryForPatch(patchName, false);
+      } else {
+        spinner.stop();
+        targetRepo = await getRepositoryForPatch(patchName, true);
+        spinner.start();
+      }
+    }
+
+    spinner.text = `Preparing release for ${patchName} to ${targetRepo}...`;
+
+    // Create release branch name (always with cow_ prefix)
+    const releaseBranch = getReleaseBranchName(patchName);
+
+    // Get the next version number
+    spinner.text = "Determining next version number...";
+    await utils.execGit(
+      ["fetch", "--all", "--tags"],
+      "Failed to fetch updates"
+    );
+
+    const version = await getNextPatchVersion(patchName);
+
+    spinner.text = `Preparing release v${version} to ${targetRepo}...`;
+
+    // Remember the current state
+    const initialState = await utils.saveGitState();
+
+    // Get base branch to use as clean slate
+    const baseBranch = await utils.getBaseBranch();
+    const baseRemote = await getBaseRemote();
+
+    // Check if release branch exists and create backup if needed
+    const branches = (
+      await utils.execGit(["branch"], "Failed to list branches")
+    )
+      .split("\n")
+      .map((branch) => branch.trim().replace("* ", ""))
+      .filter(Boolean);
+
+    // If release branch exists, create a backup branch
+    if (branches.includes(releaseBranch)) {
+      const backupBranch = `${releaseBranch}_backup_v${version}`;
+      spinner.text = `Creating backup branch ${backupBranch}...`;
+      await utils.execGit(
+        ["branch", backupBranch, releaseBranch],
+        "Failed to create backup branch"
+      );
+
+      // Checkout and reset release branch
+      await utils.execGit(
+        ["checkout", releaseBranch],
+        "Failed to checkout release branch"
+      );
+      await utils.execGit(
+        ["reset", "--hard", `${baseRemote}/${baseBranch}`],
+        "Failed to reset release branch"
+      );
+    } else {
+      // Create new release branch from base
+      await utils.execGit(
+        ["checkout", "-b", releaseBranch, `${baseRemote}/${baseBranch}`],
+        "Failed to create release branch"
+      );
+    }
+
+    // Squash merge all changes from source branch
+    spinner.text = "Merging changes...";
+    try {
+      await utils.execGit(
+        ["merge", "--squash", sourceBranch],
+        "Failed to merge source changes"
+      );
+      await utils.execGit(
+        ["commit", "-m", `${patchName} v${version}`],
+        "Failed to commit release"
+      );
+    } catch (e) {
+      // Handle conflicts
+      spinner.warn("Conflicts detected, attempting resolution...");
+      await utils.handlePackageChanges();
+
+      const hasOtherConflicts = await utils.execGit(
+        ["diff", "--name-only", "--diff-filter=U"],
+        "Failed to check conflicts"
+      );
+
+      if (hasOtherConflicts) {
+        spinner.fail("Unresolved conflicts detected");
+        // Restore to initial state
+        await utils.restoreGitState(initialState);
+        throw new Error(
+          "Merge conflicts detected. Please resolve conflicts manually and try again."
+        );
+      }
+
+      await utils.execGit(["add", "."], "Failed to stage changes");
+      await utils.execGit(
+        ["commit", "-m", `${patchName} v${version}`],
+        "Failed to commit release"
+      );
+    }
+
+    // Create version tag
+    spinner.text = "Creating version tag...";
+    await utils.execGit(
+      [
+        "tag",
+        "-a",
+        `${patchName}-v${version}`,
+        "-m",
+        `${patchName} version ${version}`,
+      ],
+      "Failed to create version tag"
+    );
+
+    // Push changes and tags to the specified repository
+    spinner.text = `Pushing changes to ${targetRepo}...`;
+    await utils.execGit(
+      ["push", "-f", targetRepo, releaseBranch],
+      "Failed to push release branch"
+    );
+    await utils.execGit(
+      ["push", targetRepo, `${patchName}-v${version}`],
+      "Failed to push tag"
+    );
+
+    // Push backup branch if it exists
+    if (branches.includes(releaseBranch)) {
+      const backupBranch = `${releaseBranch}_backup_v${version}`;
+      spinner.text = "Pushing backup branch...";
+      await utils.execGit(
+        ["push", "-f", targetRepo, backupBranch],
+        "Failed to push backup branch"
+      );
+    }
+
+    // Return to source branch
+    await utils.execGit(
+      ["checkout", sourceBranch],
+      "Failed to return to source branch"
+    );
+
+    // Store metadata about the release
+    try {
+      // Save release repository in git config for future releases
+      const configKey = `hyperfy.mod.${patchName}.repository`;
+      await utils.execGit(
+        ["config", configKey, targetRepo],
+        "Failed to save repository preference"
+      );
+    } catch (error) {
+      spinner.warn(
+        `Note: Failed to save repository preference: ${error.message}`
+      );
+    }
+
+    spinner.succeed(
+      `Successfully created release ${patchName} v${version} in ${targetRepo}`
+    );
+
+    return {
+      success: true,
+      version,
+      repository: targetRepo,
+      patchName,
+    };
+  } catch (error) {
+    spinner.fail(`Failed to create release: ${error.message}`);
+    throw error;
+  }
+}
+
 async function releaseDevPatch(patchName, existingSpinner) {
   const spinner =
     existingSpinner || ora(`Preparing release for ${patchName}`).start();
@@ -2420,11 +3674,40 @@ program
 program
   .command("init <patchName>")
   .description("Initialize a new mod development environment")
-  .action(async (patchName) => {
+  .option("-r, --repository <repository>", "Target repository for development")
+  .option(
+    "-b, --branch <branchName>",
+    "Custom branch name for development (defaults to patchName)"
+  )
+  .action(async (patchName, options) => {
     try {
-      const devBranch = `dev_cow_${patchName}`;
+      // Clean up the patch name (remove cow_ prefix if present)
+      const cleanPatchName = patchName.replace(/^cow_/, "");
+
+      // Use custom branch name if provided, otherwise use the patch name
+      const devBranch = options.branch || cleanPatchName;
+
+      // Determine target repository
+      let targetRepo;
+      if (options.repository) {
+        // Verify the specified repository exists
+        const repositories = await getRegisteredRepositories();
+        if (!repositories.some((repo) => repo.name === options.repository)) {
+          throw new Error(
+            `Repository '${options.repository}' is not registered. Use 'repository add' to add it first.`
+          );
+        }
+        targetRepo = options.repository;
+      } else if (!options.nonInteractive) {
+        // Determine the preferred repository interactively
+        targetRepo = await getPreferredReleaseRepository(cleanPatchName);
+      } else {
+        // Default to the default patches remote
+        targetRepo = PATCHES_REMOTE;
+      }
+
       const spinner = ora(
-        `Initializing development environment for ${patchName}`
+        `Initializing development environment for ${cleanPatchName} (branch: ${devBranch}, target: ${targetRepo})`
       ).start();
 
       try {
@@ -2438,11 +3721,21 @@ program
           `Failed to fetch updates from ${baseRemote}`
         );
 
-        // Create dev branch if it doesn't exist
+        // Also fetch from target repository if different
+        if (targetRepo !== baseRemote) {
+          spinner.text = `Fetching latest changes from ${targetRepo}...`;
+          await utils.execGit(
+            ["fetch", targetRepo],
+            `Failed to fetch updates from ${targetRepo}`
+          );
+        }
+
+        // Check if the branch already exists
         const branches = await utils.execGit(
           ["branch"],
           "Failed to list branches"
         );
+
         if (!branches.includes(devBranch)) {
           // Use the proper remote reference for the base branch
           spinner.text = `Creating new branch ${devBranch} from ${baseRemote}/${baseBranch}...`;
@@ -2458,7 +3751,26 @@ program
           );
         }
 
-        spinner.succeed(`Development environment initialized for ${patchName}`);
+        // Store the target repository and patch name in git config
+        // This allows us to remember which patch this branch is for
+        const configKey = `hyperfy.mod.${devBranch}.patchName`;
+        await utils.execGit(
+          ["config", configKey, cleanPatchName],
+          "Failed to save patch name"
+        );
+
+        // Store the target repository in git config
+        const repoConfigKey = `hyperfy.mod.${cleanPatchName}.repository`;
+        await utils.execGit(
+          ["config", repoConfigKey, targetRepo],
+          "Failed to save repository preference"
+        );
+
+        spinner.succeed(
+          `Development environment initialized for ${cleanPatchName}\n` +
+            `Branch: ${devBranch}\n` +
+            `Target repository: ${targetRepo}`
+        );
       } catch (error) {
         spinner.fail(
           `Failed to initialize development environment: ${error.message}`
@@ -2474,34 +3786,240 @@ program
   });
 
 program
-  .command("update <patchName>")
-  .description("Update mod development branch with latest base changes")
+  .command("update [branchName]")
+  .description("Update branch with latest base changes and optionally release")
   .option("-n, --non-interactive", "Skip interactive prompts")
   .option(
     "-r, --auto-release",
     "Automatically create new release if changes detected"
   )
-  .action(async (patchName, options) => {
+  .option(
+    "--repository <repository>",
+    "Specify target repository for release (if auto-releasing)"
+  )
+  .action(async (branchName, options) => {
     try {
-      // Pass options directly to updateDevPatch
-      await updateDevPatch(patchName, options);
+      // If no branch name is provided, use current branch
+      let sourceBranch = branchName;
+      if (!sourceBranch) {
+        sourceBranch = await utils.getCurrentBranch();
+        console.log(`Using current branch: ${sourceBranch}`);
+      }
+
+      // Check if source branch is a base branch
+      if (await isBaseBranch(sourceBranch)) {
+        throw new Error(
+          `Cannot update base branch: ${sourceBranch}. Please use a feature branch.`
+        );
+      }
+
+      // Update the branch using the flexible method
+      const result = await updateBranch(sourceBranch, options);
+
+      if (result.success) {
+        // Display information about what happened
+        if (result.hadChanges) {
+          log(
+            `Branch was updated with changes from the base branch`,
+            "success"
+          );
+
+          if (result.released) {
+            log(
+              `Released ${result.patchName} v${result.version} to ${result.repository}`,
+              "success"
+            );
+          }
+        } else {
+          log(`Branch was already up to date with the base branch`, "info");
+        }
+      }
     } catch (e) {
-      console.error(`Failed to update development branch: ${e.message}`);
+      console.error(`Failed to update branch: ${e.message}`);
       process.exit(1);
     }
   });
 
 program
   .command("update-all")
-  .description("Update all dev patches with latest base changes")
+  .description("Update all feature branches with latest base changes")
   .option("-n, --non-interactive", "Skip interactive prompts")
   .option(
     "-r, --auto-release",
-    "Automatically create new releases for successfully updated patches with changes"
+    "Automatically create new releases for successfully updated branches with changes"
   )
   .action(async (options) => {
     try {
-      await batchUpdateDevPatches(options);
+      const spinner = ora("Finding feature branches to update...").start();
+
+      // Get all local branches
+      const allBranches = (
+        await utils.execGit(["branch"], "Failed to list branches")
+      )
+        .split("\n")
+        .map((b) => b.trim().replace("* ", ""))
+        .filter(Boolean);
+
+      // Filter out base branches and empty names
+      const baseBranch = await utils.getBaseBranch();
+      const commonBaseBranches = [
+        baseBranch,
+        "main",
+        "master",
+        "dev",
+        "develop",
+        "development",
+      ];
+
+      const featureBranches = allBranches.filter(
+        (branch) => !commonBaseBranches.includes(branch) && branch.trim() !== ""
+      );
+
+      if (featureBranches.length === 0) {
+        spinner.info("No feature branches found to update");
+        return;
+      }
+
+      // Store current branch to return to it later
+      const originalBranch = await utils.getCurrentBranch();
+
+      // Stash any uncommitted changes at the start
+      spinner.text = "Checking for uncommitted changes...";
+      const changesStashed = await stashChanges();
+      if (changesStashed) {
+        spinner.info("Uncommitted changes stashed");
+      }
+
+      // First ensure we have the latest base branch
+      spinner.text = "Updating base branch...";
+      await utils.ensureLatestBase();
+
+      // Ask which branches to update if in interactive mode
+      let branchesToUpdate = featureBranches;
+      if (!options.nonInteractive) {
+        spinner.stop(); // Stop spinner during user input
+
+        const choices = featureBranches.map((branch) => {
+          return {
+            name: branch,
+            value: branch,
+            checked: true,
+          };
+        });
+
+        const { selectedBranches } = await inquirer.prompt([
+          {
+            type: "checkbox",
+            name: "selectedBranches",
+            message: "Select branches to update:",
+            choices,
+            pageSize: 10,
+          },
+        ]);
+
+        branchesToUpdate = selectedBranches;
+
+        if (branchesToUpdate.length === 0) {
+          spinner.info("No branches selected for update");
+          if (changesStashed) {
+            await popStashedChanges(changesStashed);
+            spinner.succeed("Stashed changes restored");
+          }
+          return;
+        }
+
+        spinner.start(
+          `Preparing to update ${branchesToUpdate.length} branches...`
+        );
+      } else {
+        spinner.info(
+          `Found ${featureBranches.length} feature branches to process`
+        );
+      }
+
+      const updatedBranches = [];
+      const releasedBranches = [];
+      const failedBranches = [];
+
+      for (const branch of branchesToUpdate) {
+        spinner.text = `Processing ${branch}...`;
+
+        try {
+          // Update branch using the flexible method
+          const result = await updateBranch(branch, {
+            ...options,
+            // Don't restore stashes for each branch, we'll do it at the end
+            skipStashRestore: true,
+          });
+
+          if (result.success) {
+            updatedBranches.push({
+              name: branch,
+              patchName: result.patchName,
+              hadChanges: result.hadChanges,
+            });
+
+            if (result.released) {
+              releasedBranches.push({
+                name: branch,
+                patchName: result.patchName,
+                version: result.version,
+              });
+            }
+          }
+        } catch (error) {
+          failedBranches.push({
+            name: branch,
+            error: error.message,
+          });
+          spinner.warn(`Failed to process ${branch}: ${error.message}`);
+        }
+      }
+
+      // Return to original branch
+      await utils.execGit(
+        ["checkout", originalBranch],
+        "Failed to return to original branch"
+      );
+
+      // Restore stashed changes
+      if (changesStashed) {
+        spinner.text = "Restoring stashed changes...";
+        await popStashedChanges(changesStashed);
+        spinner.info("Stashed changes restored");
+      }
+
+      // Final status report
+      if (failedBranches.length > 0) {
+        spinner.warn("\nSome branches failed to process:");
+        failedBranches.forEach((branch) => {
+          console.log(chalk.yellow(`\n${branch.name}:`));
+          console.log(chalk.gray(`  Error: ${branch.error}`));
+        });
+      }
+
+      if (updatedBranches.length > 0) {
+        spinner.succeed(
+          `Successfully processed ${updatedBranches.length} branches`
+        );
+        updatedBranches.forEach((branch) => {
+          const icon = branch.hadChanges ? chalk.green("✓") : chalk.blue("ℹ");
+          console.log(
+            `${icon} ${branch.name} (${branch.patchName}): ${
+              branch.hadChanges ? "Changes detected" : "No significant changes"
+            }`
+          );
+        });
+      }
+
+      if (releasedBranches.length > 0) {
+        console.log(chalk.green("\nReleased patches:"));
+        releasedBranches.forEach((branch) => {
+          console.log(
+            `  ${branch.name} -> ${branch.patchName} v${branch.version}`
+          );
+        });
+      }
     } catch (e) {
       console.error(`Batch update failed: ${e.message}`);
       process.exit(1);
@@ -2509,31 +4027,273 @@ program
   });
 
 program
-  .command("release <patchName>")
-  .description("Create a new release from development branch")
-  .action(async (patchName) => {
+  .command("release [branchName]")
+  .description("Create a new release from the current or specified branch")
+  .option("-r, --repository <repository>", "Target repository for the release")
+  .action(async (branchName, options) => {
     try {
-      const devBranch = `dev_cow_${patchName}`;
-      const currentBranch = await utils.getCurrentBranch();
+      const spinner = ora("Preparing release...").start();
 
-      // Verify we're on dev branch
-      if (currentBranch !== devBranch) {
+      // Get current branch if no branch name is provided
+      let sourceBranch = branchName;
+      if (!sourceBranch) {
+        sourceBranch = await utils.getCurrentBranch();
+        spinner.text = `Using current branch: ${sourceBranch}`;
+      }
+
+      // Check if source branch is a base branch (main, master, dev, etc.)
+      const baseBranch = await utils.getBaseBranch();
+      const forbiddenBranches = [
+        baseBranch,
+        "main",
+        "master",
+        "dev",
+        "develop",
+        "development",
+      ];
+
+      if (forbiddenBranches.includes(sourceBranch)) {
+        spinner.fail(
+          `Cannot create a release from base branch: ${sourceBranch}`
+        );
         throw new Error(
-          `Not on development branch. Please checkout ${devBranch} first.`
+          "Please use a feature branch for releases, not a base branch"
         );
       }
 
-      // Use our enhanced release function
-      await releaseDevPatch(patchName);
+      // Determine patch name based on branch name
+      let patchName;
+
+      // Case 1: Legacy naming convention (dev_cow_patchName)
+      if (sourceBranch.startsWith("dev_cow_")) {
+        patchName = sourceBranch.replace("dev_cow_", "");
+        spinner.text = `Detected legacy branch format. Using patch name: ${patchName}`;
+      }
+      // Case 2: Already a release branch (cow_patchName)
+      else if (sourceBranch.startsWith("cow_")) {
+        patchName = sourceBranch.replace("cow_", "");
+        spinner.text = `Using release branch directly. Patch name: ${patchName}`;
+      }
+      // Case 3: Regular branch name, use as-is for patch name
+      else {
+        patchName = sourceBranch;
+        spinner.text = `Using branch name as patch name: ${patchName}`;
+      }
+
+      // Get target repository - either from options, or determine it
+      let targetRepo;
+      if (options.repository) {
+        // Verify the specified repository exists
+        const repositories = await getRegisteredRepositories();
+        if (!repositories.some((repo) => repo.name === options.repository)) {
+          spinner.fail(`Repository '${options.repository}' not found`);
+          throw new Error(
+            `Repository '${options.repository}' is not registered. Use 'repository add' to add it first.`
+          );
+        }
+        targetRepo = options.repository;
+      } else {
+        spinner.stop(); // Pause spinner for interactive prompt
+
+        // Determine the preferred repository interactively
+        targetRepo = await getPreferredReleaseRepository(patchName);
+
+        // Resume spinner
+        spinner.start(`Using repository: ${targetRepo}`);
+      }
+
+      // Create release branch name (always with cow_ prefix)
+      const releaseBranch = `cow_${patchName}`;
+
+      // Get the next version number
+      spinner.text = "Determining next version number...";
+      await utils.execGit(
+        ["fetch", "--all", "--tags"],
+        "Failed to fetch updates"
+      );
+
+      // Get all version tags for this mod
+      const tags = await utils.execGit(
+        ["tag", "-l", `${patchName}-v*`],
+        "Failed to list versions"
+      );
+
+      let version = "1.0.0";
+      if (tags) {
+        const versions = tags
+          .split("\n")
+          .map((tag) => tag.replace(`${patchName}-v`, ""))
+          .filter(Boolean)
+          .map((version) => {
+            const [major, minor, patch] = version.split(".").map(Number);
+            return { major, minor, patch, original: version };
+          })
+          .sort((a, b) => {
+            if (a.major !== b.major) return b.major - a.major;
+            if (a.minor !== b.minor) return b.minor - a.minor;
+            return b.patch - a.patch;
+          });
+
+        if (versions.length > 0) {
+          const latest = versions[0];
+          version = `${latest.major}.${latest.minor}.${latest.patch + 1}`;
+        }
+      }
+
+      spinner.text = `Preparing release v${version} to ${targetRepo}...`;
+
+      // Remember the current state
+      const initialState = await utils.saveGitState();
+
+      // Check if release branch exists and create backup if needed
+      const branches = (
+        await utils.execGit(["branch"], "Failed to list branches")
+      )
+        .split("\n")
+        .map((branch) => branch.trim().replace("* ", ""))
+        .filter(Boolean);
+
+      let backupCreated = false;
+      let backupBranch = "";
+
+      // If release branch exists, create a backup branch
+      if (branches.includes(releaseBranch)) {
+        backupBranch = `${releaseBranch}_backup_v${version}`;
+        spinner.text = `Creating backup branch ${backupBranch}...`;
+        await utils.execGit(
+          ["branch", backupBranch, releaseBranch],
+          "Failed to create backup branch"
+        );
+        backupCreated = true;
+      }
+
+      // Get base branch for clean slate
+      const baseRemote = await getBaseRemote();
+
+      // Create/reset release branch from base
+      if (branches.includes(releaseBranch)) {
+        // Checkout and reset release branch
+        await utils.execGit(
+          ["checkout", releaseBranch],
+          "Failed to checkout release branch"
+        );
+        await utils.execGit(
+          ["reset", "--hard", `${baseRemote}/${baseBranch}`],
+          "Failed to reset release branch"
+        );
+      } else {
+        await utils.execGit(
+          ["checkout", "-b", releaseBranch, `${baseRemote}/${baseBranch}`],
+          "Failed to create release branch"
+        );
+      }
+
+      // Squash merge all changes from source branch
+      spinner.text = "Merging changes...";
+      try {
+        await utils.execGit(
+          ["merge", "--squash", sourceBranch],
+          "Failed to merge source changes"
+        );
+        await utils.execGit(
+          ["commit", "-m", `${patchName} v${version}`],
+          "Failed to commit release"
+        );
+      } catch (e) {
+        // Handle conflicts
+        spinner.warn("Conflicts detected, attempting resolution...");
+        await utils.handlePackageChanges();
+
+        const hasOtherConflicts = await utils.execGit(
+          ["diff", "--name-only", "--diff-filter=U"],
+          "Failed to check conflicts"
+        );
+
+        if (hasOtherConflicts) {
+          spinner.fail("Unresolved conflicts detected");
+          // Restore initial state
+          await utils.restoreGitState(initialState);
+          throw new Error(
+            "Merge conflicts detected. Please resolve conflicts manually and try again."
+          );
+        }
+
+        await utils.execGit(["add", "."], "Failed to stage changes");
+        await utils.execGit(
+          ["commit", "-m", `${patchName} v${version}`],
+          "Failed to commit release"
+        );
+      }
+
+      // Create version tag
+      spinner.text = "Creating version tag...";
+      await utils.execGit(
+        [
+          "tag",
+          "-a",
+          `${patchName}-v${version}`,
+          "-m",
+          `${patchName} version ${version}`,
+        ],
+        "Failed to create version tag"
+      );
+
+      // Push changes and tags to the specified repository
+      spinner.text = `Pushing changes to ${targetRepo}...`;
+      await utils.execGit(
+        ["push", "-f", targetRepo, releaseBranch],
+        "Failed to push release branch"
+      );
+      await utils.execGit(
+        ["push", targetRepo, `${patchName}-v${version}`],
+        "Failed to push tag"
+      );
+
+      // Push backup branch if it exists
+      if (backupCreated) {
+        spinner.text = "Pushing backup branch...";
+        await utils.execGit(
+          ["push", "-f", targetRepo, backupBranch],
+          "Failed to push backup branch"
+        );
+      }
+
+      // Return to original branch
+      await utils.execGit(
+        ["checkout", sourceBranch],
+        "Failed to return to original branch"
+      );
+
+      // Store metadata about the release
+      try {
+        // Save release repository in git config for future releases
+        const configKey = `hyperfy.mod.${patchName}.repository`;
+        await utils.execGit(
+          ["config", configKey, targetRepo],
+          "Failed to save repository preference"
+        );
+      } catch (error) {
+        spinner.warn(
+          `Note: Failed to save repository preference: ${error.message}`
+        );
+      }
+
+      spinner.succeed(
+        `Successfully created release ${patchName} v${version} in ${targetRepo}` +
+          (backupCreated ? `\nBackup saved in ${backupBranch}` : "")
+      );
     } catch (e) {
       console.error(`Failed to prepare release: ${e.message}`);
       process.exit(1);
     }
   });
 
+// Update the apply command to handle repository prefixes
 program
   .command("apply [patchNames...]")
-  .description("Apply one or more mods")
+  .description(
+    "Apply one or more mods (use remote/patch_name format for custom repositories)"
+  )
   .option(
     "-v, --version <version>",
     "specific version to install (only for single patch)"
@@ -2549,7 +4309,54 @@ program
 
       // If no patch names provided, show interactive selection menu
       if (patchNames.length === 0) {
-        const selectedPatches = await promptForPatches();
+        // Get available patches from all repositories
+        const allPatches = await searchPatches();
+
+        if (allPatches.length === 0) {
+          console.log("No patches available to apply.");
+          return;
+        }
+
+        const patchChoices = await Promise.all(
+          allPatches.map(async (patch) => {
+            try {
+              const { author, relativeTime } = await getPatchInfo(
+                patch.name,
+                patch.remote
+              );
+              // Display with repository prefix if not the default repo
+              const displayName =
+                patch.remote !== PATCHES_REMOTE
+                  ? `${patch.remote}/${patch.name}`
+                  : patch.name;
+              return {
+                name: `${displayName} (by ${author}, ${relativeTime})`,
+                value: `${patch.remote}/${patch.name}`,
+              };
+            } catch (error) {
+              // Fallback if we can't get patch info
+              const displayName =
+                patch.remote !== PATCHES_REMOTE
+                  ? `${patch.remote}/${patch.name}`
+                  : patch.name;
+              return {
+                name: displayName,
+                value: `${patch.remote}/${patch.name}`,
+              };
+            }
+          })
+        );
+
+        const { selectedPatches } = await inquirer.prompt([
+          {
+            type: "checkbox",
+            name: "selectedPatches",
+            message: "Select patches to apply:",
+            choices: patchChoices,
+            pageSize: 10,
+          },
+        ]);
+
         if (selectedPatches.length === 0) {
           log("No patches selected to apply", "info");
           return;
@@ -2560,8 +4367,13 @@ program
       // For version-specific installation
       if (patchNames.length === 1 && options.version) {
         const patchName = patchNames[0];
+        // Parse the patch name to get remote and name
+        const { remote, patchName: parsedName } = await parsePatchName(
+          patchName
+        );
+
         const spinner = ora(
-          `Installing ${patchName} v${options.version}`
+          `Installing ${parsedName} v${options.version} from ${remote}`
         ).start();
         try {
           await utils.execGit(
@@ -2580,7 +4392,7 @@ program
 
           try {
             await utils.execGit(
-              ["cherry-pick", `${patchName}-v${options.version}`],
+              ["cherry-pick", `${parsedName}-v${options.version}`],
               "Failed to apply mod version"
             );
           } catch (e) {
@@ -2590,20 +4402,24 @@ program
               "Failed to abort cherry-pick"
             );
             await utils.execGit(
-              ["cherry-pick", "-n", `${patchName}-v${options.version}`],
+              ["cherry-pick", "-n", `${parsedName}-v${options.version}`],
               "Failed to apply mod version"
             );
 
             await utils.handlePackageChanges();
             await utils.execGit(["add", "."], "Failed to stage changes");
             await utils.execGit(
-              ["commit", "-m", `Installed ${patchName} v${options.version}`],
+              [
+                "commit",
+                "-m",
+                `Installed ${remote}/${parsedName} v${options.version}`,
+              ],
               "Failed to commit changes"
             );
           }
 
           spinner.succeed(
-            `Successfully installed ${patchName} v${options.version}`
+            `Successfully installed ${remote}/${parsedName} v${options.version}`
           );
         } catch (error) {
           spinner.fail(`Failed to install version: ${error.message}`);
@@ -2612,10 +4428,18 @@ program
       } else {
         // Apply each patch in sequence
         for (const patchName of patchNames) {
-          const cleanPatchName = patchName.startsWith("cow_")
-            ? patchName
-            : `cow_${patchName}`;
-          await applyPatch(cleanPatchName);
+          // Parse the patch name to get remote and name
+          const { remote, patchName: parsedName } = await parsePatchName(
+            patchName
+          );
+
+          // Format the patch name for the remote
+          const cleanPatchName = parsedName.startsWith("cow_")
+            ? parsedName
+            : `cow_${parsedName}`;
+
+          // Apply the patch from the specified remote
+          await applyPatchFromRepo(cleanPatchName, remote);
         }
       }
 
@@ -2716,9 +4540,12 @@ program
     }
   });
 
+// Update the search command to search across all repositories
 program
   .command("search [patchName]")
-  .description("Search for patches (lists all if no name provided)")
+  .description(
+    "Search for patches across all repositories (lists all if no name provided)"
+  )
   .action(async (patchName) => {
     try {
       const patches = await searchPatches(patchName);
@@ -2729,65 +4556,90 @@ program
         return;
       }
 
+      // Group patches by repository for better display
+      const patchesByRepo = {};
+      for (const patch of patches) {
+        if (!patchesByRepo[patch.remote]) {
+          patchesByRepo[patch.remote] = [];
+        }
+        patchesByRepo[patch.remote].push(patch.name);
+      }
+
       // If a specific mod is searched, show its versions too
       if (patchName) {
-        await utils.execGit(
-          ["fetch", "--all", "--tags"],
-          "Failed to fetch updates"
-        );
+        for (const [repo, repoPatches] of Object.entries(patchesByRepo)) {
+          for (const patch of repoPatches) {
+            await utils.execGit(
+              ["fetch", "--all", "--tags"],
+              "Failed to fetch updates"
+            );
 
-        // Get tag list
-        const tagsOutput = await utils.execGit(
-          [
-            "tag",
-            "-l",
-            `${patchName}-v*`,
-            "--format=%(tag)|%(taggername)|%(taggerdate:relative)|%(subject)",
-          ],
-          "Failed to list versions"
-        );
+            // Get tag list
+            const tagsOutput = await utils.execGit(
+              [
+                "tag",
+                "-l",
+                `${patch}-v*`,
+                "--format=%(tag)|%(taggername)|%(taggerdate:relative)|%(subject)",
+              ],
+              "Failed to list versions"
+            );
 
-        const versions = tagsOutput
-          .split("\n")
-          .filter(Boolean)
-          .map((line) => {
-            const [tag, tagger, date, subject] = line.split("|");
-            return {
-              version: tag.replace(`${patchName}-v`, ""),
-              tagger: tagger.trim(),
-              date: date.trim(),
-              description: subject.trim(),
-            };
-          });
+            const versions = tagsOutput
+              .split("\n")
+              .filter(Boolean)
+              .map((line) => {
+                const [tag, tagger, date, subject] = line.split("|");
+                return {
+                  version: tag.replace(`${patch}-v`, ""),
+                  tagger: tagger.trim(),
+                  date: date.trim(),
+                  description: subject.trim(),
+                };
+              });
 
-        // First show the mod info
-        for (const patch of patches) {
-          const { author, relativeTime } = await getPatchInfo(patch);
-          console.log(chalk.cyan(`  ${patch}`));
-          console.log(`    Author: ${author}`);
-          console.log(`    Created: ${relativeTime}`);
-        }
+            // First show the mod info
+            const { author, relativeTime } = await getPatchInfo(patch, repo);
+            // Display with repository prefix if not the default repo
+            const displayName =
+              repo !== PATCHES_REMOTE ? `${repo}/${patch}` : patch;
+            console.log(chalk.cyan(`  ${displayName}`));
+            console.log(`    Author: ${author}`);
+            console.log(`    Created: ${relativeTime}`);
+            console.log(`    Repository: ${repo}`);
 
-        // Then show version info if available
-        if (versions.length > 0) {
-          console.log(`\nVersions available:`);
-          for (const version of versions) {
-            console.log(chalk.green(`  v${version.version}`));
-            console.log(`    Author: ${version.tagger}`);
-            console.log(`    Released: ${version.date}`);
-            if (version.description) {
-              console.log(`    Description: ${version.description}`);
+            // Then show version info if available
+            if (versions.length > 0) {
+              console.log(`\nVersions available:`);
+              for (const version of versions) {
+                console.log(chalk.green(`  v${version.version}`));
+                console.log(`    Author: ${version.tagger}`);
+                console.log(`    Released: ${version.date}`);
+                if (version.description) {
+                  console.log(`    Description: ${version.description}`);
+                }
+                console.log(); // Add a blank line between versions
+              }
+            } else {
+              console.log("\nNo versions available");
             }
-            console.log(); // Add a blank line between versions
           }
-        } else {
-          console.log("\nNo versions available");
         }
       } else {
-        // Show all patches without versions
-        for (const patch of patches) {
-          const { author, relativeTime } = await getPatchInfo(patch);
-          console.log(`  - ${patch} (by ${author}, ${relativeTime})`);
+        // Show all patches organized by repository
+        for (const [repo, repoPatches] of Object.entries(patchesByRepo)) {
+          // Display repository header
+          console.log(
+            chalk.blue(
+              `\n${repo}${repo === PATCHES_REMOTE ? " (default)" : ""}:`
+            )
+          );
+
+          // Show patches from this repository
+          for (const patch of repoPatches) {
+            const { author, relativeTime } = await getPatchInfo(patch, repo);
+            console.log(`  - ${patch} (by ${author}, ${relativeTime})`);
+          }
         }
       }
     } catch (e) {
@@ -2884,6 +4736,63 @@ program
 
 // Update command groups to include metadata management
 commandGroups.mod.commands.push("update-metadata", "metadata");
+
+// Add repository management commands
+const repoCommand = new Command("repository").description(
+  "Repository management commands"
+);
+
+repoCommand
+  .command("add <name> [url]")
+  .description("Add a new mod repository")
+  .action(async (name, url) => {
+    try {
+      const success = await addRepository(name, url);
+      if (success) {
+        log(`Repository '${name}' added successfully`, "success");
+        await listRepositories();
+      }
+    } catch (e) {
+      console.error(`Failed to add repository: ${e.message}`);
+      process.exit(1);
+    }
+  });
+
+repoCommand
+  .command("remove <name>")
+  .description("Remove a mod repository")
+  .action(async (name) => {
+    try {
+      const success = await removeRepository(name);
+      if (success) {
+        log(`Repository '${name}' removed successfully`, "success");
+        await listRepositories();
+      }
+    } catch (e) {
+      console.error(`Failed to remove repository: ${e.message}`);
+      process.exit(1);
+    }
+  });
+
+repoCommand
+  .command("list")
+  .description("List all registered mod repositories")
+  .action(async () => {
+    try {
+      await listRepositories();
+    } catch (e) {
+      console.error(`Failed to list repositories: ${e.message}`);
+      process.exit(1);
+    }
+  });
+
+program.addCommand(repoCommand);
+
+// Update commandGroups to include repository management
+commandGroups.repo = {
+  description: "Repository Management:",
+  commands: ["repository add", "repository remove", "repository list"],
+};
 
 // Add a pre-action hook to validate the project before any command
 program.hook("preAction", async (thisCommand, actionCommand) => {
