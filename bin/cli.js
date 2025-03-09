@@ -2343,6 +2343,8 @@ async function syncPatches(options = {}) {
               await applyPatchFromRepo(cleanPatchName, PATCHES_REMOTE);
             }
           }
+
+          await setupEnvironment(spinner);
         } catch (e) {
           spinner.fail(`Failed to reapply ${patchName}: ${e.message}`);
           failedPatches.push({
@@ -4122,6 +4124,10 @@ program
           await applyPatchFromRepo(cleanPatchName, remote);
         }
       }
+
+      // After all patches have been applied, check for environment variables
+      const spinner = ora("Checking for environment variables...").start();
+      await setupEnvironment(spinner);
 
       // Display the list of all applied patches
       await listPatches();
