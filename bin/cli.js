@@ -1987,7 +1987,7 @@ async function getAppliedPatches() {
   return appliedPatches.reverse(); // Reverse to get them in application order
 }
 
-async function syncPatches() {
+async function syncPatches(options = {}) {
   const spinner = ora("Starting mod synchronization...").start();
 
   try {
@@ -2062,23 +2062,33 @@ async function syncPatches() {
     spinner.text = "Getting currently applied patches...";
     const appliedPatches = await getAppliedPatches();
 
+    // Fetch latest tags and refs to check for newer versions
+    spinner.text = "Fetching latest tags and refs...";
+    await utils
+      .execGit(["fetch", "--all", "--tags"], "Failed to fetch updates")
+      .catch((e) => {
+        // Log but continue if fetch fails
+        spinner.warn(`Could not fetch latest refs: ${e.message}`);
+      });
+
     try {
       // Reset to base branch
       spinner.text = "Resetting to base branch...";
       await resetPatches();
 
-      // Reapply each mod with its proper metadata
+      // Reapply each mod with proper metadata, checking for newer versions
       const failedPatches = [];
+      const updatedPatches = [];
 
       for (const patch of appliedPatches) {
         // Extract all the needed metadata
         const patchName = patch.name;
-        const version = patch.version;
+        const originalVersion = patch.version;
         const originalCommitHash = patch.originalCommitHash;
         const modBaseBranchHash = patch.modBaseBranchHash;
 
-        spinner.text = `Reapplying mod ${patchName}${
-          version ? ` v${version}` : ""
+        spinner.text = `Checking for updates to mod ${patchName}${
+          originalVersion ? ` v${originalVersion}` : ""
         }...`;
 
         try {
@@ -2088,23 +2098,70 @@ async function syncPatches() {
             const remoteName = parts[0];
             const patchNameOnly = parts.slice(1).join("/");
 
-            if (version) {
+            // Get the tag-compatible name for version checking
+            const tagCompatibleName = getTagCompatibleName(patchName);
+
+            // Check if a newer version is available
+            let latestVersion = originalVersion;
+            let shouldUseLatestVersion = false;
+
+            if (originalVersion) {
+              // Check for newer versions
+              const allVersions = await getAvailableVersions(tagCompatibleName);
+
+              if (
+                allVersions.length > 0 &&
+                allVersions[0] !== originalVersion
+              ) {
+                latestVersion = allVersions[0];
+
+                // Ask user if they want to update to the newer version or use the interactive option
+                if (!options.nonInteractive) {
+                  spinner.stop(); // Pause spinner for user input
+
+                  const { updateToLatest } = await inquirer.prompt([
+                    {
+                      type: "confirm",
+                      name: "updateToLatest",
+                      message: `Newer version available for ${patchName}: v${latestVersion} (current: v${originalVersion}). Update?`,
+                      default: true,
+                    },
+                  ]);
+
+                  shouldUseLatestVersion = updateToLatest;
+                  spinner.start(); // Resume spinner
+                } else if (options.autoUpdate) {
+                  // Auto-update if configured
+                  shouldUseLatestVersion = true;
+                  spinner.info(
+                    `Auto-updating ${patchName} from v${originalVersion} to v${latestVersion}`
+                  );
+                } else {
+                  // Default to keeping current version
+                  spinner.info(
+                    `Newer version v${latestVersion} available for ${patchName}, keeping v${originalVersion} (use --auto-update to upgrade)`
+                  );
+                }
+              }
+            }
+
+            // Determine which version to use
+            const versionToUse = shouldUseLatestVersion
+              ? latestVersion
+              : originalVersion;
+
+            if (versionToUse) {
               // Handle versioned patch
-              spinner.text = `Applying versioned patch ${patchName} v${version}...`;
-
-              // Create tag-compatible name for the versioned patch
-              const tagCompatibleName = getTagCompatibleName(patchName);
-
-              // Fetch all tags to ensure we have the latest
-              await utils.execGit(
-                ["fetch", "--all", "--tags"],
-                "Failed to fetch updates"
-              );
+              spinner.text = `Applying versioned patch ${patchName} v${versionToUse}...`;
 
               try {
                 // Apply the changes via cherry-pick but with custom commit
                 await utils.execGit(
-                  ["cherry-pick", "-n", `${tagCompatibleName}-v${version}`],
+                  [
+                    "cherry-pick",
+                    "-n",
+                    `${tagCompatibleName}-v${versionToUse}`,
+                  ],
                   "Failed to apply mod version"
                 );
 
@@ -2123,7 +2180,7 @@ async function syncPatches() {
                 const enhancedCommitMessage =
                   await generateEnhancedCommitMessage(
                     patchName,
-                    version,
+                    versionToUse,
                     originalCommitHash,
                     modBaseBranchHash,
                     currentBaseBranchHash
@@ -2134,6 +2191,14 @@ async function syncPatches() {
                   ["commit", "-m", enhancedCommitMessage],
                   "Failed to commit changes"
                 );
+
+                if (shouldUseLatestVersion) {
+                  updatedPatches.push({
+                    name: patchName,
+                    oldVersion: originalVersion,
+                    newVersion: versionToUse,
+                  });
+                }
               } catch (e) {
                 spinner.warn(
                   `Failed to apply versioned patch, aborting: ${e.message}`
@@ -2160,25 +2225,70 @@ async function syncPatches() {
               ? patchName
               : `cow_${patchName}`;
 
-            if (version) {
-              // Handle versioned legacy patch
-              spinner.text = `Applying legacy versioned patch ${patchName} v${version}...`;
-
-              // For legacy patches, assume the default remote
+            if (originalVersion) {
+              // Check for newer versions first
               const tagCompatibleName = getTagCompatibleName(
                 `${PATCHES_REMOTE}/${patchName}`
               );
 
-              // Fetch all tags to ensure we have the latest
-              await utils.execGit(
-                ["fetch", "--all", "--tags"],
-                "Failed to fetch updates"
-              );
+              // Check if a newer version is available
+              let latestVersion = originalVersion;
+              let shouldUseLatestVersion = false;
+
+              // Check for newer versions
+              const allVersions = await getAvailableVersions(tagCompatibleName);
+
+              if (
+                allVersions.length > 0 &&
+                allVersions[0] !== originalVersion
+              ) {
+                latestVersion = allVersions[0];
+
+                // Ask user if they want to update to the newer version or use the interactive option
+                if (!options.nonInteractive) {
+                  spinner.stop(); // Pause spinner for user input
+
+                  const { updateToLatest } = await inquirer.prompt([
+                    {
+                      type: "confirm",
+                      name: "updateToLatest",
+                      message: `Newer version available for ${patchName}: v${latestVersion} (current: v${originalVersion}). Update?`,
+                      default: true,
+                    },
+                  ]);
+
+                  shouldUseLatestVersion = updateToLatest;
+                  spinner.start(); // Resume spinner
+                } else if (options.autoUpdate) {
+                  // Auto-update if configured
+                  shouldUseLatestVersion = true;
+                  spinner.info(
+                    `Auto-updating ${patchName} from v${originalVersion} to v${latestVersion}`
+                  );
+                } else {
+                  // Default to keeping current version
+                  spinner.info(
+                    `Newer version v${latestVersion} available for ${patchName}, keeping v${originalVersion} (use --auto-update to upgrade)`
+                  );
+                }
+              }
+
+              // Determine which version to use
+              const versionToUse = shouldUseLatestVersion
+                ? latestVersion
+                : originalVersion;
+
+              // Handle legacy versioned patch
+              spinner.text = `Applying legacy versioned patch ${patchName} v${versionToUse}...`;
 
               try {
                 // Apply the changes via cherry-pick but with custom commit
                 await utils.execGit(
-                  ["cherry-pick", "-n", `${tagCompatibleName}-v${version}`],
+                  [
+                    "cherry-pick",
+                    "-n",
+                    `${tagCompatibleName}-v${versionToUse}`,
+                  ],
                   "Failed to apply mod version"
                 );
 
@@ -2197,7 +2307,7 @@ async function syncPatches() {
                 const enhancedCommitMessage =
                   await generateEnhancedCommitMessage(
                     patchName,
-                    version,
+                    versionToUse,
                     originalCommitHash,
                     modBaseBranchHash,
                     currentBaseBranchHash
@@ -2208,6 +2318,14 @@ async function syncPatches() {
                   ["commit", "-m", enhancedCommitMessage],
                   "Failed to commit changes"
                 );
+
+                if (shouldUseLatestVersion) {
+                  updatedPatches.push({
+                    name: patchName,
+                    oldVersion: originalVersion,
+                    newVersion: versionToUse,
+                  });
+                }
               } catch (e) {
                 spinner.warn(
                   `Failed to apply versioned patch, aborting: ${e.message}`
@@ -2250,6 +2368,18 @@ async function syncPatches() {
         log("Your repository has been restored to its original state.", "info");
       } else {
         spinner.succeed("Successfully synchronized all patches");
+
+        // Show summary of updates
+        if (updatedPatches.length > 0) {
+          console.log(chalk.green("\nUpdated patches:"));
+          updatedPatches.forEach((patch) => {
+            console.log(
+              chalk.green(
+                `  - ${patch.name}: v${patch.oldVersion} → v${patch.newVersion}`
+              )
+            );
+          });
+        }
       }
 
       // Show final patch list
@@ -2269,6 +2399,55 @@ async function syncPatches() {
     throw e;
   }
 }
+
+/**
+ * Get all available versions for a patch, sorted newest first
+ * @param {string} tagCompatibleName - The tag-compatible name of the patch
+ * @returns {Promise<string[]>} - Array of version strings, sorted newest first
+ */
+async function getAvailableVersions(tagCompatibleName) {
+  try {
+    // Ensure we have the latest tags
+    await utils.execGit(
+      ["fetch", "--all", "--tags"],
+      "Failed to fetch updates"
+    );
+
+    // Get all version tags for this patch
+    const tags = await utils.execGit(
+      ["tag", "-l", `${tagCompatibleName}-v*`],
+      "Failed to list versions"
+    );
+
+    if (!tags) {
+      return [];
+    }
+
+    // Parse and sort versions
+    const versions = tags
+      .split("\n")
+      .map((tag) => tag.replace(`${tagCompatibleName}-v`, ""))
+      .filter(Boolean)
+      .map((version) => {
+        const [major, minor, patch] = version.split(".").map(Number);
+        return { major, minor, patch, original: version };
+      })
+      .sort((a, b) => {
+        if (a.major !== b.major) return b.major - a.major;
+        if (a.minor !== b.minor) return b.minor - a.minor;
+        return b.patch - a.patch;
+      });
+
+    // Return sorted version strings
+    return versions.map((v) => v.original);
+  } catch (error) {
+    console.warn(
+      `Error getting versions for ${tagCompatibleName}: ${error.message}`
+    );
+    return [];
+  }
+}
+
 async function interactiveInstall(options = {}) {
   try {
     const isGitRepo = await fs
@@ -3789,15 +3968,6 @@ program
             ["fetch", "--all", "--tags"],
             "Failed to fetch updates"
           );
-          const baseBranch = await utils.getBaseBranch();
-          const currentBranch = await utils.getCurrentBranch();
-
-          if (currentBranch !== baseBranch) {
-            await utils.execGit(
-              ["checkout", baseBranch],
-              "Failed to checkout base branch"
-            );
-          }
 
           try {
             // Use the tag-compatible name for the tag reference
@@ -4076,9 +4246,14 @@ program
 program
   .command("sync")
   .description("Reset and reapply all patches to ensure clean state")
-  .action(async () => {
+  .option("-n, --non-interactive", "Skip interactive prompts")
+  .option(
+    "-u, --auto-update",
+    "Automatically update to the latest version of each patch"
+  )
+  .action(async (options) => {
     try {
-      await syncPatches();
+      await syncPatches(options);
     } catch (e) {
       console.error(`Sync failed: ${e.message}`);
       process.exit(1);
