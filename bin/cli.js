@@ -3969,31 +3969,124 @@ program
             "Failed to fetch updates"
           );
 
+          // Get tag ref for the specified version
+          const tagRef = `${tagCompatibleName}-v${options.version}`;
+
+          // Get the original commit hash and message from the tag
+          spinner.text = "Getting mod metadata...";
+          const originalCommitHash = await utils.execGit(
+            ["rev-list", "-n", "1", tagRef],
+            `Failed to find commit hash for tag ${tagRef}`
+          );
+
+          const commitMessage = await utils.execGit(
+            ["log", "-1", "--format=%B", originalCommitHash],
+            `Failed to get commit message for tag ${tagRef}`
+          );
+
+          // Get current base branch hash
+          const baseBranch = await utils.getBaseBranch();
+          const baseRemote = await getBaseRemote();
+          const currentBaseBranchHash = await utils.execGit(
+            ["rev-parse", `${baseRemote}/${baseBranch}`],
+            "Failed to get current base branch commit hash"
+          );
+
+          // Try to extract mod base branch hash from the original commit message
+          let modBaseBranchHash = null;
+          const parsedMessage = parseEnhancedCommitMessage(commitMessage);
+
+          if (
+            parsedMessage &&
+            parsedMessage.currentBaseBranchHash &&
+            parsedMessage.currentBaseBranchHash !== "unknown"
+          ) {
+            // If the original commit has metadata, use its current-base as our mod-base
+            modBaseBranchHash = parsedMessage.currentBaseBranchHash;
+          } else if (
+            parsedMessage &&
+            parsedMessage.modBaseBranchHash &&
+            parsedMessage.modBaseBranchHash !== "unknown"
+          ) {
+            // Or use mod-base if available
+            modBaseBranchHash = parsedMessage.modBaseBranchHash;
+          } else {
+            // For patches without enhanced metadata, we'll try to find the parent commit
+            try {
+              // Try to find the parent commit that the mod was based on
+              const parentHash = await utils.execGit(
+                ["rev-list", "--parents", "-n", "1", originalCommitHash],
+                "Failed to get parent commit"
+              );
+
+              // The format is: <commit> <parent1> <parent2> ...
+              const parents = parentHash.split(" ");
+              if (parents.length > 1) {
+                // Use the first parent as the base hash
+                modBaseBranchHash = parents[1];
+              } else {
+                // Fallback to current base branch hash if we can't determine
+                modBaseBranchHash = currentBaseBranchHash;
+              }
+            } catch (e) {
+              // If all else fails, use current base branch hash
+              modBaseBranchHash = currentBaseBranchHash;
+            }
+          }
+
+          spinner.text = "Applying mod changes...";
+
           try {
-            // Use the tag-compatible name for the tag reference
+            // Apply the changes via cherry-pick
             await utils.execGit(
-              ["cherry-pick", `${tagCompatibleName}-v${options.version}`],
+              ["cherry-pick", tagRef],
               "Failed to apply mod version"
             );
+
+            // Generate enhanced commit message with metadata
+            const enhancedCommitMessage = await generateEnhancedCommitMessage(
+              `${remote}/${parsedName}`,
+              options.version,
+              originalCommitHash,
+              modBaseBranchHash,
+              currentBaseBranchHash
+            );
+
+            // Update commit message with enhanced metadata
+            await utils.execGit(
+              ["commit", "--amend", "-m", enhancedCommitMessage],
+              "Failed to update commit message"
+            );
           } catch (e) {
-            spinner.warn("Conflicts detected, attempting resolution...");
+            spinner.warn(
+              "Cherry-pick failed, attempting alternative approach..."
+            );
             await utils.execGit(
               ["cherry-pick", "--abort"],
               "Failed to abort cherry-pick"
             );
             await utils.execGit(
-              ["cherry-pick", "-n", `${tagCompatibleName}-v${options.version}`],
+              ["cherry-pick", "-n", tagRef],
               "Failed to apply mod version"
             );
 
+            // Handle package changes
+            spinner.text = "Handling package dependencies...";
             await utils.handlePackageChanges();
             await utils.execGit(["add", "."], "Failed to stage changes");
+
+            // Generate enhanced commit message with metadata
+            const enhancedCommitMessage = await generateEnhancedCommitMessage(
+              `${remote}/${parsedName}`,
+              options.version,
+              originalCommitHash,
+              modBaseBranchHash,
+              currentBaseBranchHash
+            );
+
+            // Commit with enhanced message
             await utils.execGit(
-              [
-                "commit",
-                "-m",
-                `cow: ${remote}/${parsedName} v${options.version}`,
-              ],
+              ["commit", "-m", enhancedCommitMessage],
               "Failed to commit changes"
             );
           }
