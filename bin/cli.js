@@ -42,6 +42,38 @@ function log(message, type = "info") {
 }
 
 /**
+ * Convert a potentially namespaced patch name to a tag-compatible format
+ * @param {string} patchName - The patch name (potentially with repo prefix)
+ * @returns {string} - The tag-compatible format replacing / with -
+ */
+function getTagCompatibleName(patchName) {
+  // Replace any forward slashes with hyphens for git tag compatibility
+  return patchName.replace(/\//g, "-");
+}
+
+/**
+ * Extract repository and patch name from a tag-compatible name
+ * @param {string} tagName - The tag name without version suffix
+ * @returns {Object} - Object with repository and patchName
+ */
+function parseTagCompatibleName(tagName) {
+  // If there's no hyphen, it's not a namespaced patch
+  if (!tagName.includes("-")) {
+    return {
+      repository: PATCHES_REMOTE,
+      patchName: tagName,
+    };
+  }
+
+  // Split on first hyphen to get repo and patch parts
+  const firstHyphen = tagName.indexOf("-");
+  const repository = tagName.substring(0, firstHyphen);
+  const patchName = tagName.substring(firstHyphen + 1);
+
+  return { repository, patchName };
+}
+
+/**
  * Get the associated patch name for a branch
  * This first checks git config to see if a mapping exists,
  * then falls back to naming conventions
@@ -1473,7 +1505,6 @@ async function removePatch(patchName) {
     await utils.handlePackageChanges();
 
     spinner.succeed(`Successfully removed mod: ${patchName}`);
-
   } catch (error) {
     spinner.fail(`Failed to remove mod: ${error.message}`);
     log("Rolling back to initial state...", "warning");
@@ -1524,17 +1555,34 @@ async function listPatches() {
         let updateMessage = "";
         if (patch.version) {
           try {
-            // Get all tags for this patch
-            const cleanPatchName = patchName.split("/").pop();
+            // Instead of using just the clean patch name, use the tag-compatible format
+            // that includes the repository name to avoid conflicts
+
+            // Extract repo and patch parts
+            let repoName, patchNamePart;
+            if (patchName.includes("/")) {
+              [repoName, patchNamePart] = patchName.split("/", 2);
+            } else {
+              // For backward compatibility with non-namespaced patches
+              repoName = PATCHES_REMOTE;
+              patchNamePart = patchName;
+            }
+
+            // Create tag-compatible name
+            const tagCompatibleName = getTagCompatibleName(
+              `${repoName}/${patchNamePart}`
+            );
+
+            // Get all tags for this patch using the tag-compatible name
             const tags = await utils.execGit(
-              ["tag", "-l", `${cleanPatchName}-v*`],
+              ["tag", "-l", `${tagCompatibleName}-v*`],
               "Failed to list versions"
             );
 
             if (tags) {
               const versions = tags
                 .split("\n")
-                .map((tag) => tag.replace(`${cleanPatchName}-v`, ""))
+                .map((tag) => tag.replace(`${tagCompatibleName}-v`, ""))
                 .filter(Boolean)
                 .map((ver) => {
                   const [major, minor, patch] = ver.split(".").map(Number);
@@ -1751,7 +1799,7 @@ async function resetPatches() {
     // Set up upstream tracking
     try {
       await utils.execGit(
-        ["branch", `--set-upstream-to=${PATCHES_REMOTE}/${originalBaseBranch}`],
+        ["branch", `--set-upstream-to=${originalBaseBranch}`],
         "Failed to set upstream"
       );
     } catch (e) {
@@ -2005,12 +2053,16 @@ async function searchPatches(searchTerm = "") {
       );
 
       // Filter remote branches that follow the patch pattern (cow_*)
+      // MODIFIED: Updated to exclude our new backup branch format (cow_repoName_patchName_v*)
       const remoteBranches = branches
         .split("\n")
         .map((b) => b.trim())
         .filter(
           (b) =>
-            b.startsWith(`remotes/${repo.name}/cow_`) && !b.includes("backup")
+            b.startsWith(`remotes/${repo.name}/cow_`) &&
+            !b.includes("backup") &&
+            // Exclude our new backup branch format
+            !b.match(/remotes\/.*\/cow_.*_.*_v\d/)
         )
         .map((b) => b.replace(`remotes/${repo.name}/`, ""))
         .map((b) => b.replace(`cow_`, "")); // Remove package prefix
@@ -2200,11 +2252,9 @@ async function syncPatches() {
 
     const failedPatches = [];
 
-    const patchMap = {};
-
     // Store current patches before reset
     spinner.text = "Getting currently applied patches...";
-    const appliedPatches = await utils.getAppliedPatches();
+    const appliedPatches = await getAppliedPatches();
 
     // Reset to base branch
     spinner.text = "Resetting to base branch...";
@@ -2224,23 +2274,27 @@ async function syncPatches() {
             "Failed to fetch updates"
           );
 
+          // For namespaced patch, create tag-compatible name
+          let tagCompatibleName = patch.name;
+          if (patch.name.includes("/")) {
+            tagCompatibleName = getTagCompatibleName(patch.name);
+          }
+
           // Get the original commit hash for the version tag
           let originalCommitHash;
           try {
             originalCommitHash = await utils.execGit(
-              ["rev-parse", `${patch.name}-v${patch.version}`],
+              ["rev-parse", `${tagCompatibleName}-v${patch.version}`],
               "Failed to get original commit hash for version tag"
             );
           } catch (e) {
-            // If we can't get the tag hash, try to use the stored one
-            originalCommitHash = patchMap[patch.name]
-              ? patchMap[patch.name].originalCommitHash
-              : null;
+            // If we can't get the tag hash, just continue with null
+            originalCommitHash = null;
           }
 
           try {
             await utils.execGit(
-              ["cherry-pick", `${patch.name}-v${patch.version}`],
+              ["cherry-pick", `${tagCompatibleName}-v${patch.version}`],
               "Failed to apply mod version"
             );
           } catch (e) {
@@ -2253,7 +2307,7 @@ async function syncPatches() {
               "Failed to abort cherry-pick"
             );
             await utils.execGit(
-              ["cherry-pick", "-n", `${patch.name}-v${patch.version}`],
+              ["cherry-pick", "-n", `${tagCompatibleName}-v${patch.version}`],
               "Failed to apply mod version"
             );
 
@@ -2265,12 +2319,28 @@ async function syncPatches() {
             );
           }
         } else {
-          // Regular mod application
-          const cleanPatchName = patch.name.startsWith("cow_")
-            ? patch.name
-            : `cow_${patch.name}`;
+          // Regular mod application - use applyPatchFromRepo for better namespace handling
+          if (patch.name.includes("/")) {
+            // Extract the remote and patch name from the namespaced format
+            const parts = patch.name.split("/");
+            const remoteName = parts[0];
+            const patchName = parts.slice(1).join("/");
 
-          await applyPatch(cleanPatchName);
+            // Format the patch name for the remote
+            const cleanPatchName = patchName.startsWith("cow_")
+              ? patchName
+              : `cow_${patchName}`;
+
+            // Apply using the more robust function
+            await applyPatchFromRepo(cleanPatchName, remoteName);
+          } else {
+            // For non-namespaced patches, use the default remote
+            const cleanPatchName = patch.name.startsWith("cow_")
+              ? patch.name
+              : `cow_${patch.name}`;
+
+            await applyPatchFromRepo(cleanPatchName, PATCHES_REMOTE);
+          }
         }
       } catch (e) {
         spinner.fail(`Failed to reapply ${patch.name}: ${e.message}`);
@@ -2652,6 +2722,9 @@ async function releaseModToRepository(patchName, repoName, existingSpinner) {
     // Format branch names
     const releaseBranch = `cow_${patchName}`;
 
+    // Create tag-compatible name for the patch
+    const tagCompatibleName = getTagCompatibleName(`${repoName}/${patchName}`);
+
     // Get the next version number
     spinner.text = "Determining next version number...";
     await utils.execGit(
@@ -2659,9 +2732,9 @@ async function releaseModToRepository(patchName, repoName, existingSpinner) {
       "Failed to fetch updates"
     );
 
-    // Get all version tags for this mod
+    // Get all version tags for this mod using the tag-compatible name
     const tags = await utils.execGit(
-      ["tag", "-l", `${patchName}-v*`],
+      ["tag", "-l", `${tagCompatibleName}-v*`],
       "Failed to list versions"
     );
 
@@ -2669,7 +2742,7 @@ async function releaseModToRepository(patchName, repoName, existingSpinner) {
     if (tags) {
       const versions = tags
         .split("\n")
-        .map((tag) => tag.replace(`${patchName}-v`, ""))
+        .map((tag) => tag.replace(`${tagCompatibleName}-v`, ""))
         .filter(Boolean)
         .map((version) => {
           const [major, minor, patch] = version.split(".").map(Number);
@@ -2705,7 +2778,8 @@ async function releaseModToRepository(patchName, repoName, existingSpinner) {
 
     // If release branch exists, create a backup branch
     if (branches.includes(releaseBranch)) {
-      const backupBranch = `${releaseBranch}_backup_v${version}`;
+      // MODIFIED: Changed the backup branch naming scheme to include repository name
+      const backupBranch = `cow_${repoName}_${patchName}_v${version}`;
       spinner.text = `Creating backup branch ${backupBranch}...`;
       await utils.execGit(
         ["branch", backupBranch, releaseBranch],
@@ -2825,13 +2899,13 @@ async function releaseModToRepository(patchName, repoName, existingSpinner) {
       );
     }
 
-    // Create version tag
+    // Create version tag - using the new tag-compatible name format
     spinner.text = "Creating version tag...";
     await utils.execGit(
       [
         "tag",
         "-a",
-        `${patchName}-v${version}`,
+        `${tagCompatibleName}-v${version}`,
         "-m",
         `${patchName} version ${version}`,
       ],
@@ -2845,12 +2919,13 @@ async function releaseModToRepository(patchName, repoName, existingSpinner) {
       "Failed to push release branch"
     );
     await utils.execGit(
-      ["push", repoName, `${patchName}-v${version}`],
+      ["push", repoName, `${tagCompatibleName}-v${version}`],
       "Failed to push tag"
     );
 
     // Push backup branch if it exists
-    const backupBranch = `${releaseBranch}_backup_v${version}`;
+    // MODIFIED: Changed the backup branch naming scheme to include repository name
+    const backupBranch = `cow_${repoName}_${patchName}_v${version}`;
     if (branches.includes(releaseBranch)) {
       spinner.text = "Pushing backup branch...";
       await utils.execGit(
@@ -3085,6 +3160,11 @@ async function releaseBranch(sourceBranch, patchName = null, options = {}) {
 
     spinner.text = `Preparing release for ${patchName} to ${targetRepo}...`;
 
+    // Create the tag-compatible name
+    const tagCompatibleName = getTagCompatibleName(
+      `${targetRepo}/${patchName}`
+    );
+
     // Create release branch name (always with cow_ prefix)
     const releaseBranch = getReleaseBranchName(patchName);
 
@@ -3095,7 +3175,8 @@ async function releaseBranch(sourceBranch, patchName = null, options = {}) {
       "Failed to fetch updates"
     );
 
-    const version = await getNextPatchVersion(patchName);
+    // Use tag-compatible name for version lookup
+    const version = await getNextPatchVersion(tagCompatibleName);
 
     spinner.text = `Preparing release v${version} to ${targetRepo}...`;
 
@@ -3114,15 +3195,23 @@ async function releaseBranch(sourceBranch, patchName = null, options = {}) {
       .map((branch) => branch.trim().replace("* ", ""))
       .filter(Boolean);
 
+    let backupCreated = false;
+    let backupBranch = "";
+
     // If release branch exists, create a backup branch
     if (branches.includes(releaseBranch)) {
-      const backupBranch = `${releaseBranch}_backup_v${version}`;
+      // MODIFIED: Changed the backup branch naming scheme to include repository name
+      backupBranch = `cow_${targetRepo}_${patchName}_v${version}`;
       spinner.text = `Creating backup branch ${backupBranch}...`;
       await utils.execGit(
         ["branch", backupBranch, releaseBranch],
         "Failed to create backup branch"
       );
+      backupCreated = true;
+    }
 
+    // Create/reset release branch from base
+    if (branches.includes(releaseBranch)) {
       // Checkout and reset release branch
       await utils.execGit(
         ["checkout", releaseBranch],
@@ -3177,13 +3266,13 @@ async function releaseBranch(sourceBranch, patchName = null, options = {}) {
       );
     }
 
-    // Create version tag
+    // Create version tag using the tag-compatible name
     spinner.text = "Creating version tag...";
     await utils.execGit(
       [
         "tag",
         "-a",
-        `${patchName}-v${version}`,
+        `${tagCompatibleName}-v${version}`,
         "-m",
         `${patchName} version ${version}`,
       ],
@@ -3197,13 +3286,12 @@ async function releaseBranch(sourceBranch, patchName = null, options = {}) {
       "Failed to push release branch"
     );
     await utils.execGit(
-      ["push", targetRepo, `${patchName}-v${version}`],
+      ["push", targetRepo, `${tagCompatibleName}-v${version}`],
       "Failed to push tag"
     );
 
     // Push backup branch if it exists
-    if (branches.includes(releaseBranch)) {
-      const backupBranch = `${releaseBranch}_backup_v${version}`;
+    if (backupCreated) {
       spinner.text = "Pushing backup branch...";
       await utils.execGit(
         ["push", "-f", targetRepo, backupBranch],
@@ -3214,7 +3302,7 @@ async function releaseBranch(sourceBranch, patchName = null, options = {}) {
     // Return to source branch
     await utils.execGit(
       ["checkout", sourceBranch],
-      "Failed to return to source branch"
+      "Failed to return to original branch"
     );
 
     // Store metadata about the release
@@ -3232,7 +3320,8 @@ async function releaseBranch(sourceBranch, patchName = null, options = {}) {
     }
 
     spinner.succeed(
-      `Successfully created release ${patchName} v${version} in ${targetRepo}`
+      `Successfully created release ${patchName} v${version} in ${targetRepo}` +
+        (backupCreated ? `\nBackup saved in ${backupBranch}` : "")
     );
 
     return {
@@ -3248,7 +3337,7 @@ async function releaseBranch(sourceBranch, patchName = null, options = {}) {
 }
 
 // Helper function to determine next version number for a patch
-async function getNextPatchVersion(patchName) {
+async function getNextPatchVersion(tagCompatibleName) {
   try {
     await utils.execGit(
       ["fetch", "--all", "--tags"],
@@ -3256,8 +3345,9 @@ async function getNextPatchVersion(patchName) {
     );
 
     // Get all version tags for this patch
+    // tagCompatibleName should already be in tag-compatible format
     const tags = await utils.execGit(
-      ["tag", "-l", `${patchName}-v*`],
+      ["tag", "-l", `${tagCompatibleName}-v*`],
       "Failed to list versions"
     );
 
@@ -3268,7 +3358,7 @@ async function getNextPatchVersion(patchName) {
     // Find highest version
     const versions = tags
       .split("\n")
-      .map((tag) => tag.replace(`${patchName}-v`, ""))
+      .map((tag) => tag.replace(`${tagCompatibleName}-v`, ""))
       .filter(Boolean)
       .map((version) => {
         const [major, minor, patch] = version.split(".").map(Number);
@@ -3288,7 +3378,7 @@ async function getNextPatchVersion(patchName) {
     return `${latest.major}.${latest.minor}.${latest.patch + 1}`;
   } catch (error) {
     console.warn(
-      `Error determining version for ${patchName}, using 1.0.0:`,
+      `Error determining version for ${tagCompatibleName}, using 1.0.0:`,
       error.message
     );
     return "1.0.0";
@@ -3843,7 +3933,8 @@ program
 
       // If release branch exists, create a backup branch
       if (branches.includes(releaseBranch)) {
-        backupBranch = `${releaseBranch}_backup_v${version}`;
+        // MODIFIED: Changed the backup branch naming scheme to include repository name
+        backupBranch = `cow_${targetRepo}_${patchName}_v${version}`;
         spinner.text = `Creating backup branch ${backupBranch}...`;
         await utils.execGit(
           ["branch", backupBranch, releaseBranch],
@@ -3912,11 +4003,14 @@ program
 
       // Create version tag
       spinner.text = "Creating version tag...";
+      const tagCompatibleName = getTagCompatibleName(
+        `${targetRepo}/${patchName}`
+      );
       await utils.execGit(
         [
           "tag",
           "-a",
-          `${patchName}-v${version}`,
+          `${tagCompatibleName}-v${version}`,
           "-m",
           `${patchName} version ${version}`,
         ],
@@ -3930,7 +4024,7 @@ program
         "Failed to push release branch"
       );
       await utils.execGit(
-        ["push", targetRepo, `${patchName}-v${version}`],
+        ["push", targetRepo, `${tagCompatibleName}-v${version}`],
         "Failed to push tag"
       );
 
@@ -4056,6 +4150,11 @@ program
           patchName
         );
 
+        // Create tag-compatible name for the patch
+        const tagCompatibleName = getTagCompatibleName(
+          `${remote}/${parsedName}`
+        );
+
         const spinner = ora(
           `Installing ${parsedName} v${options.version} from ${remote}`
         ).start();
@@ -4075,8 +4174,9 @@ program
           }
 
           try {
+            // Use the tag-compatible name for the tag reference
             await utils.execGit(
-              ["cherry-pick", `${parsedName}-v${options.version}`],
+              ["cherry-pick", `${tagCompatibleName}-v${options.version}`],
               "Failed to apply mod version"
             );
           } catch (e) {
@@ -4086,7 +4186,7 @@ program
               "Failed to abort cherry-pick"
             );
             await utils.execGit(
-              ["cherry-pick", "-n", `${parsedName}-v${options.version}`],
+              ["cherry-pick", "-n", `${tagCompatibleName}-v${options.version}`],
               "Failed to apply mod version"
             );
 
@@ -4237,7 +4337,6 @@ program
     }
   });
 
-// Update the search command to search across all repositories
 program
   .command("search [patchName]")
   .description(
@@ -4271,12 +4370,15 @@ program
               "Failed to fetch updates"
             );
 
-            // Get tag list
+            // Use tag-compatible name for tag list
+            const tagCompatibleName = getTagCompatibleName(`${repo}/${patch}`);
+
+            // Get tag list using the tag-compatible name
             const tagsOutput = await utils.execGit(
               [
                 "tag",
                 "-l",
-                `${patch}-v*`,
+                `${tagCompatibleName}-v*`,
                 "--format=%(tag)|%(taggername)|%(taggerdate:relative)|%(subject)",
               ],
               "Failed to list versions"
@@ -4288,7 +4390,7 @@ program
               .map((line) => {
                 const [tag, tagger, date, subject] = line.split("|");
                 return {
-                  version: tag.replace(`${patch}-v`, ""),
+                  version: tag.replace(`${tagCompatibleName}-v`, ""),
                   tagger: tagger.trim(),
                   date: date.trim(),
                   description: subject.trim(),
