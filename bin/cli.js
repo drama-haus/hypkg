@@ -3526,33 +3526,20 @@ program
         "Failed to fetch updates"
       );
 
-      // Get all version tags for this mod
-      const tags = await utils.execGit(
-        ["tag", "-l", `${patchName}-v*`],
-        "Failed to list versions"
+      // Create the tag-compatible name
+      const tagCompatibleName = getTagCompatibleName(
+        `${targetRepo}/${patchName}`
       );
 
-      let version = "1.0.0";
-      if (tags) {
-        const versions = tags
-          .split("\n")
-          .map((tag) => tag.replace(`${patchName}-v`, ""))
-          .filter(Boolean)
-          .map((version) => {
-            const [major, minor, patch] = version.split(".").map(Number);
-            return { major, minor, patch, original: version };
-          })
-          .sort((a, b) => {
-            if (a.major !== b.major) return b.major - a.major;
-            if (a.minor !== b.minor) return b.minor - a.minor;
-            return b.patch - a.patch;
-          });
+      // Get the next version number
+      spinner.text = "Determining next version number...";
+      await utils.execGit(
+        ["fetch", "--all", "--tags"],
+        "Failed to fetch updates"
+      );
 
-        if (versions.length > 0) {
-          const latest = versions[0];
-          version = `${latest.major}.${latest.minor}.${latest.patch + 1}`;
-        }
-      }
+      // Use tag-compatible name for version lookup
+      const version = await getNextPatchVersion(tagCompatibleName);
 
       spinner.text = `Preparing release v${version} to ${targetRepo}...`;
 
@@ -3642,9 +3629,9 @@ program
 
       // Create version tag
       spinner.text = "Creating version tag...";
-      const tagCompatibleName = getTagCompatibleName(
-        `${targetRepo}/${patchName}`
-      );
+      // const tagCompatibleName = getTagCompatibleName(
+      //   `${targetRepo}/${patchName}`
+      // );
       await utils.execGit(
         [
           "tag",
