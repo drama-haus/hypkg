@@ -2055,124 +2055,220 @@ async function syncPatches() {
       return;
     }
 
-    const failedPatches = [];
+    // Store initial state before any operations
+    const initialState = await utils.saveGitState();
 
-    // Store current patches before reset
+    // Store the list of patches with their complete metadata
     spinner.text = "Getting currently applied patches...";
     const appliedPatches = await getAppliedPatches();
 
-    // Reset to base branch
-    spinner.text = "Resetting to base branch...";
-    await resetPatches();
+    try {
+      // Reset to base branch
+      spinner.text = "Resetting to base branch...";
+      await resetPatches();
 
-    // Reapply each mod
-    for (const patch of appliedPatches) {
-      spinner.text = `Reapplying mod ${patch.name}${
-        patch.version ? ` v${patch.version}` : ""
-      }...`;
+      // Reapply each mod with its proper metadata
+      const failedPatches = [];
 
-      try {
-        if (patch.version) {
-          // Version-specific installation
-          await utils.execGit(
-            ["fetch", "--all", "--tags"],
-            "Failed to fetch updates"
-          );
+      for (const patch of appliedPatches) {
+        // Extract all the needed metadata
+        const patchName = patch.name;
+        const version = patch.version;
+        const originalCommitHash = patch.originalCommitHash;
+        const modBaseBranchHash = patch.modBaseBranchHash;
 
-          // For namespaced patch, create tag-compatible name
-          let tagCompatibleName = patch.name;
-          if (patch.name.includes("/")) {
-            tagCompatibleName = getTagCompatibleName(patch.name);
-          }
+        spinner.text = `Reapplying mod ${patchName}${
+          version ? ` v${version}` : ""
+        }...`;
 
-          // Get the original commit hash for the version tag
-          let originalCommitHash;
-          try {
-            originalCommitHash = await utils.execGit(
-              ["rev-parse", `${tagCompatibleName}-v${patch.version}`],
-              "Failed to get original commit hash for version tag"
-            );
-          } catch (e) {
-            // If we can't get the tag hash, just continue with null
-            originalCommitHash = null;
-          }
-
-          try {
-            await utils.execGit(
-              ["cherry-pick", `${tagCompatibleName}-v${patch.version}`],
-              "Failed to apply mod version"
-            );
-          } catch (e) {
-            spinner.warn(
-              "Cherry-pick failed, attempting alternative approach..."
-            );
-
-            await utils.execGit(
-              ["cherry-pick", "--abort"],
-              "Failed to abort cherry-pick"
-            );
-            await utils.execGit(
-              ["cherry-pick", "-n", `${tagCompatibleName}-v${patch.version}`],
-              "Failed to apply mod version"
-            );
-
-            await utils.handlePackageChanges();
-            await utils.execGit(["add", "."], "Failed to stage changes");
-            await utils.execGit(
-              ["commit", "-m", `Installed ${patch.name} v${patch.version}`],
-              "Failed to commit changes"
-            );
-          }
-        } else {
-          // Regular mod application - use applyPatchFromRepo for better namespace handling
-          if (patch.name.includes("/")) {
+        try {
+          if (patchName.includes("/")) {
             // Extract the remote and patch name from the namespaced format
-            const parts = patch.name.split("/");
+            const parts = patchName.split("/");
             const remoteName = parts[0];
-            const patchName = parts.slice(1).join("/");
+            const patchNameOnly = parts.slice(1).join("/");
 
-            // Format the patch name for the remote
+            if (version) {
+              // Handle versioned patch
+              spinner.text = `Applying versioned patch ${patchName} v${version}...`;
+
+              // Create tag-compatible name for the versioned patch
+              const tagCompatibleName = getTagCompatibleName(patchName);
+
+              // Fetch all tags to ensure we have the latest
+              await utils.execGit(
+                ["fetch", "--all", "--tags"],
+                "Failed to fetch updates"
+              );
+
+              try {
+                // Apply the changes via cherry-pick but with custom commit
+                await utils.execGit(
+                  ["cherry-pick", "-n", `${tagCompatibleName}-v${version}`],
+                  "Failed to apply mod version"
+                );
+
+                // Get base branch hash for metadata
+                const baseRemote = await getBaseRemote();
+                const currentBaseBranchHash = await utils.execGit(
+                  ["rev-parse", `${baseRemote}/${baseBranch}`],
+                  "Failed to get current base branch commit hash"
+                );
+
+                // Handle any package changes
+                await utils.handlePackageChanges();
+                await utils.execGit(["add", "."], "Failed to stage changes");
+
+                // Create an enhanced commit message with proper metadata
+                const enhancedCommitMessage =
+                  await generateEnhancedCommitMessage(
+                    patchName,
+                    version,
+                    originalCommitHash,
+                    modBaseBranchHash,
+                    currentBaseBranchHash
+                  );
+
+                // Commit with the enhanced message
+                await utils.execGit(
+                  ["commit", "-m", enhancedCommitMessage],
+                  "Failed to commit changes"
+                );
+              } catch (e) {
+                spinner.warn(
+                  `Failed to apply versioned patch, aborting: ${e.message}`
+                );
+                await utils
+                  .execGit(
+                    ["cherry-pick", "--abort"],
+                    "Failed to abort cherry-pick"
+                  )
+                  .catch(() => {}); // Ignore errors if no cherry-pick in progress
+                throw e;
+              }
+            } else {
+              // Apply non-versioned patch using the robust function
+              const cleanPatchName = patchNameOnly.startsWith("cow_")
+                ? patchNameOnly
+                : `cow_${patchNameOnly}`;
+
+              await applyPatchFromRepo(cleanPatchName, remoteName);
+            }
+          } else {
+            // Legacy non-namespaced patch
             const cleanPatchName = patchName.startsWith("cow_")
               ? patchName
               : `cow_${patchName}`;
 
-            // Apply using the more robust function
-            await applyPatchFromRepo(cleanPatchName, remoteName);
-          } else {
-            // For non-namespaced patches, use the default remote
-            const cleanPatchName = patch.name.startsWith("cow_")
-              ? patch.name
-              : `cow_${patch.name}`;
+            if (version) {
+              // Handle versioned legacy patch
+              spinner.text = `Applying legacy versioned patch ${patchName} v${version}...`;
 
-            await applyPatchFromRepo(cleanPatchName, PATCHES_REMOTE);
+              // For legacy patches, assume the default remote
+              const tagCompatibleName = getTagCompatibleName(
+                `${PATCHES_REMOTE}/${patchName}`
+              );
+
+              // Fetch all tags to ensure we have the latest
+              await utils.execGit(
+                ["fetch", "--all", "--tags"],
+                "Failed to fetch updates"
+              );
+
+              try {
+                // Apply the changes via cherry-pick but with custom commit
+                await utils.execGit(
+                  ["cherry-pick", "-n", `${tagCompatibleName}-v${version}`],
+                  "Failed to apply mod version"
+                );
+
+                // Get base branch hash for metadata
+                const baseRemote = await getBaseRemote();
+                const currentBaseBranchHash = await utils.execGit(
+                  ["rev-parse", `${baseRemote}/${baseBranch}`],
+                  "Failed to get current base branch commit hash"
+                );
+
+                // Handle any package changes
+                await utils.handlePackageChanges();
+                await utils.execGit(["add", "."], "Failed to stage changes");
+
+                // Create an enhanced commit message with proper metadata
+                const enhancedCommitMessage =
+                  await generateEnhancedCommitMessage(
+                    patchName,
+                    version,
+                    originalCommitHash,
+                    modBaseBranchHash,
+                    currentBaseBranchHash
+                  );
+
+                // Commit with the enhanced message
+                await utils.execGit(
+                  ["commit", "-m", enhancedCommitMessage],
+                  "Failed to commit changes"
+                );
+              } catch (e) {
+                spinner.warn(
+                  `Failed to apply versioned patch, aborting: ${e.message}`
+                );
+                await utils
+                  .execGit(
+                    ["cherry-pick", "--abort"],
+                    "Failed to abort cherry-pick"
+                  )
+                  .catch(() => {}); // Ignore errors if no cherry-pick in progress
+                throw e;
+              }
+            } else {
+              // Apply non-versioned legacy patch
+              await applyPatchFromRepo(cleanPatchName, PATCHES_REMOTE);
+            }
           }
+        } catch (e) {
+          spinner.fail(`Failed to reapply ${patchName}: ${e.message}`);
+          failedPatches.push({
+            name: patchName,
+            error: e.message,
+          });
         }
-      } catch (e) {
-        spinner.fail(`Failed to reapply ${patch.name}: ${e.message}`);
-        failedPatches.push({
-          name: patch.name,
-          error: e.message,
-        });
       }
-    }
 
-    if (failedPatches.length > 0) {
-      spinner.warn("Some patches failed to reapply:");
-      failedPatches.forEach((patch) => {
-        console.log(chalk.yellow(`  - ${patch.name}: ${patch.error}`));
-      });
-    } else {
-      spinner.succeed("Successfully synchronized all patches");
-    }
+      if (failedPatches.length > 0) {
+        spinner.warn(
+          "Some patches failed to reapply. Restoring original state..."
+        );
+        // Restore to initial state
+        await utils.restoreGitState(initialState);
 
-    // Show final patch list
-    await listPatches();
+        // Show which patches failed
+        spinner.warn("The following patches failed to reapply:");
+        failedPatches.forEach((patch) => {
+          console.log(chalk.yellow(`  - ${patch.name}: ${patch.error}`));
+        });
+
+        log("Your repository has been restored to its original state.", "info");
+      } else {
+        spinner.succeed("Successfully synchronized all patches");
+      }
+
+      // Show final patch list
+      await listPatches();
+    } catch (e) {
+      spinner.fail(`Sync process failed: ${e.message}`);
+
+      // Restore to initial state
+      spinner.info("Restoring to original state...");
+      await utils.restoreGitState(initialState);
+
+      log("Your repository has been restored to its original state.", "info");
+      throw e;
+    }
   } catch (e) {
     spinner.fail(`Sync failed: ${e.message}`);
     throw e;
   }
 }
-
 async function interactiveInstall(options = {}) {
   try {
     const isGitRepo = await fs
