@@ -22,10 +22,94 @@ const config = {
   packageName: packageJson.name,
 };
 
-const PATCHES_REMOTE = packageJson.config.patchesRemoteName;
 const TARGET_REPO = packageJson.config.targetRepo;
 const PACKAGE_NAME = packageJson.name;
 let BRANCH_NAME = PACKAGE_NAME;
+
+/**
+ * Fetch verified repositories from GitHub
+ * @returns {Promise<Array<{url: string, name: string, owner: string}>>}
+ */
+async function fetchVerifiedRepositories() {
+  try {
+    // These values would need to be updated with actual GitHub repo details
+    const owner = "drama-haus";
+    const repo = "hyp-studio";
+    const path = "forks.json";
+
+    const response = await fetch(
+      `https://raw.githubusercontent.com/${owner}/${repo}/main/${path}`,
+      { timeout: 5000 }
+    );
+
+    if (!response.ok) {
+      console.warn(`Failed to fetch verified repositories: ${response.status}`);
+      return [];
+    }
+
+    return await response.json();
+  } catch (error) {
+    console.warn(`Error fetching verified repositories: ${error.message}`);
+    return [];
+  }
+}
+
+/**
+ * Get the first verified repository or prompt user to select one
+ * @param {boolean} interactive - Whether to allow interactive selection
+ * @returns {Promise<string|null>} - Repository name or null if none available
+ */
+async function getPreferredVerifiedRepository(interactive = true) {
+  const verifiedRepos = await fetchVerifiedRepositories();
+  const repositories = await getRegisteredRepositories();
+
+  // Map URLs to repo names
+  const verifiedRepoNames = new Set();
+  for (const vRepo of verifiedRepos) {
+    for (const repo of repositories) {
+      if (repo.url === vRepo.url) {
+        verifiedRepoNames.add(repo.name);
+      }
+    }
+  }
+
+  const verifiedNames = Array.from(verifiedRepoNames);
+
+  if (verifiedNames.length === 0) {
+    return null;
+  }
+
+  if (verifiedNames.length === 1 || !interactive) {
+    return verifiedNames[0];
+  }
+
+  // Interactive selection
+  const { selectedRepo } = await inquirer.prompt([
+    {
+      type: "list",
+      name: "selectedRepo",
+      message: "Select a verified repository:",
+      choices: verifiedNames,
+    },
+  ]);
+
+  return selectedRepo;
+}
+
+/**
+ * Check if a repository is verified
+ * @param {string} repoName - Name of the repository
+ * @returns {Promise<boolean>} - Whether the repository is verified
+ */
+async function isVerifiedRepository(repoName) {
+  const verifiedRepos = await fetchVerifiedRepositories();
+  const repositories = await getRegisteredRepositories();
+  const repo = repositories.find((r) => r.name === repoName);
+
+  if (!repo) return false;
+
+  return verifiedRepos.some((vr) => vr.url === repo.url);
+}
 
 // Utility function for consistent logging
 function log(message, type = "info") {
@@ -56,12 +140,14 @@ function getTagCompatibleName(patchName) {
  * @returns {Object} - Object with repository and patchName
  */
 function parseTagCompatibleName(tagName) {
-  // If there's no hyphen, it's not a namespaced patch
+  // If there's no hyphen, it's a non-namespaced patch
   if (!tagName.includes("-")) {
-    return {
-      repository: PATCHES_REMOTE,
-      patchName: tagName,
-    };
+    // For backward compatibility, we'll need to interactively select
+    // or use the first verified repository
+    // This will need to be async, which may require refactoring callers
+    throw new Error(
+      "Non-namespaced patches are no longer supported. Please use 'repository/patchName' format."
+    );
   }
 
   // Split on first hyphen to get repo and patch parts
@@ -180,13 +266,9 @@ async function getRepositoryForPatch(patchName, interactive = true) {
     if (interactive) {
       // Get repository through interactive selection
       return await getPreferredReleaseRepository(patchName);
-    } else {
-      // Default to the patches remote
-      return PATCHES_REMOTE;
     }
   } catch (error) {
     console.warn(`Warning: Failed to determine repository: ${error.message}`);
-    return PATCHES_REMOTE;
   }
 }
 
@@ -529,8 +611,8 @@ async function getRegisteredRepositories() {
 
     return repositories;
   } catch (error) {
-    console.error(`Failed to get registered repositories: ${error.message}`);
-    return [{ name: PATCHES_REMOTE, url: config.patchesRepo }];
+    console.warn("Failed to get registered repositories");
+    return []; // Return empty array instead of assuming a default
   }
 }
 
@@ -689,25 +771,24 @@ async function addRepository(nameOrUrl, url) {
  */
 async function removeRepository(name) {
   try {
-    // Don't allow removing the default patches remote
-    if (name === PATCHES_REMOTE) {
+    // Check if repository is verified
+    const repositories = await getRegisteredRepositories();
+    const repo = repositories.find((r) => r.name === name);
+
+    if (!repo) {
+      throw new Error(`Repository ${name} does not exist`);
+    }
+
+    const verifiedRepos = await fetchVerifiedRepositories();
+    const isVerified = verifiedRepos.some((vr) => vr.url === repo.url);
+
+    if (isVerified) {
       throw new Error(
-        `Cannot remove the default patches remote ${PATCHES_REMOTE}`
+        `Cannot remove verified repository ${name}. Verified repositories are managed automatically.`
       );
     }
 
-    // Check if remote exists
-    const remotes = await utils.execGit(["remote"], "Failed to list remotes");
-    const remoteList = remotes
-      .split("\n")
-      .map((r) => r.trim())
-      .filter(Boolean);
-
-    if (!remoteList.includes(name)) {
-      throw new Error(`Remote ${name} does not exist`);
-    }
-
-    // Remove the remote
+    // Proceed with removal logic for non-verified repos
     await utils.execGit(
       ["remote", "remove", name],
       `Failed to remove remote ${name}`
@@ -726,14 +807,20 @@ async function removeRepository(name) {
 async function listRepositories() {
   try {
     const repositories = await getRegisteredRepositories();
+    const verifiedRepos = await fetchVerifiedRepositories();
+    const verifiedRepoMap = new Map(verifiedRepos.map((r) => [r.url, r]));
 
-    console.log("\nRegistered patch repositories:");
+    console.log("\nRegistered repositories:");
     if (repositories.length === 0) {
       console.log("  No repositories registered");
     } else {
       repositories.forEach((repo) => {
-        const isDefault = repo.name === PATCHES_REMOTE ? " (default)" : "";
-        console.log(`  - ${repo.name}${isDefault}: ${repo.url}`);
+        const verifiedInfo = verifiedRepoMap.has(repo.url)
+          ? chalk.green(
+              ` [✓ Verified]`
+            )
+          : "";
+        console.log(`  - ${repo.name}: ${repo.url}${verifiedInfo}`);
       });
     }
   } catch (error) {
@@ -786,6 +873,8 @@ async function ensureValidProject(options = {}) {
       return false;
     }
 
+    // const spinner = ora(`Validating project`).start();
+
     // Check if it's a Hyperfy project by looking at package.json
     try {
       const packageJsonContent = await fs.readFile("package.json", "utf-8");
@@ -811,6 +900,30 @@ async function ensureValidProject(options = {}) {
         if (!proceed) {
           return false;
         }
+      }
+
+      try {
+        // spinner.text = "Checking for verified repositories...";
+        const verifiedRepos = await fetchVerifiedRepositories();
+        const currentRepos = await getRegisteredRepositories();
+        const currentRepoUrls = new Map(
+          currentRepos.map((r) => [r.url, r.name])
+        );
+
+        for (const verifiedRepo of verifiedRepos) {
+          if (!currentRepoUrls.has(verifiedRepo.url)) {
+            // spinner.text = `Adding verified repository: ${verifiedRepo.name}`;
+            await addRepository(
+              verifiedRepo.name.replace(".", "-"),
+              verifiedRepo.url
+            );
+            // spinner.succeed(`Added verified repository: ${verifiedRepo.name}`);
+          }
+        }
+      } catch (error) {
+        // spinner.warn(
+        //   `Warning: Could not ensure verified repositories: ${error.message}`
+        // );
       }
     } catch (error) {
       log(`Failed to read package.json: ${error.message}`, "error");
@@ -869,28 +982,6 @@ async function ensureValidProject(options = {}) {
             "warning"
           );
         }
-      }
-    }
-
-    // Check if the patches remote exists
-    if (!remoteList.includes(PATCHES_REMOTE)) {
-      // Remote doesn't exist, set it up
-      log(`Setting up patches remote ${PATCHES_REMOTE}...`, "info");
-      try {
-        await utils.setupPatchesRemote(
-          config.patchesRepo,
-          config.patchesRemote
-        );
-        log(`Successfully set up patches remote ${PATCHES_REMOTE}`, "success");
-      } catch (error) {
-        log(
-          `Warning: Failed to set up patches remote: ${error.message}`,
-          "warning"
-        );
-        log(
-          "Proceeding without patches remote. Some features may not work.",
-          "warning"
-        );
       }
     }
 
@@ -1342,6 +1433,20 @@ async function listPatches() {
       "Failed to get current base branch commit hash"
     );
 
+    // Get verification information
+    const repositories = await getRegisteredRepositories();
+    const verifiedRepos = await fetchVerifiedRepositories();
+    const verifiedRepoMap = new Map(verifiedRepos.map((r) => [r.url, r]));
+
+    // Create a map from repo name to verification status
+    const repoVerificationMap = new Map();
+    for (const repo of repositories) {
+      repoVerificationMap.set(
+        repo.name,
+        verifiedRepoMap.has(repo.url) ? verifiedRepoMap.get(repo.url) : null
+      );
+    }
+
     spinner.succeed("Patch information gathered");
 
     console.log("\nCurrently applied patches:");
@@ -1352,27 +1457,32 @@ async function listPatches() {
         const patchName = typeof patch === "string" ? patch : patch.name;
         const version = patch.version ? ` v${patch.version}` : "";
 
-        // Line 1: Patch name and version
-        const patchLine = `  - ${patchName}${version}`;
+        // Skip non-namespaced patches if they somehow exist in the history
+        if (!patchName.includes("/")) {
+          console.log(
+            chalk.yellow(
+              `  - ${patchName}${version} (legacy format not supported)`
+            )
+          );
+          continue;
+        }
+
+        // Extract repository name from patch
+        const [repoName, ...patchNameParts] = patchName.split("/");
+        const patchNamePart = patchNameParts.join("/");
+
+        // Check if this repository is verified
+        const verifiedInfo = repoVerificationMap.get(repoName);
+        const verifiedBadge = verifiedInfo ? chalk.green(" [✓ Verified]") : "";
+
+        // Line 1: Patch name, version and verification status
+        const patchLine = `  - ${patchName}${version}${verifiedBadge}`;
         process.stdout.write(chalk.green(patchLine));
 
         // Check if a newer version is available
         let updateMessage = "";
         if (patch.version) {
           try {
-            // Instead of using just the clean patch name, use the tag-compatible format
-            // that includes the repository name to avoid conflicts
-
-            // Extract repo and patch parts
-            let repoName, patchNamePart;
-            if (patchName.includes("/")) {
-              [repoName, patchNamePart] = patchName.split("/", 2);
-            } else {
-              // For backward compatibility with non-namespaced patches
-              repoName = PATCHES_REMOTE;
-              patchNamePart = patchName;
-            }
-
             // Create tag-compatible name
             const tagCompatibleName = getTagCompatibleName(
               `${repoName}/${patchNamePart}`
@@ -1483,12 +1593,17 @@ async function listPatches() {
 
           // Also try to get author information
           const { author, relativeTime } = await getPatchInfo(
-            patchName.split("/").pop(), // Get just the patch name without repo prefix
-            patchName.split("/")[0] // Get the repo name
+            patchNamePart, // Get just the patch name without repo prefix
+            repoName // Get the repo name
           );
-          console.log(
-            chalk.gray(`    Author: ${author}, Created: ${relativeTime}`)
-          );
+
+          // Add Discord ID for verified repository owners
+          let authorInfo = `Author: ${author}, Created: ${relativeTime}`;
+          if (verifiedInfo) {
+            authorInfo += `, Verified`;
+          }
+
+          console.log(chalk.gray(`    ${authorInfo}`));
         } catch (error) {
           // Skip author info if not available
         }
@@ -1541,6 +1656,7 @@ async function listPatches() {
         )
       );
     }
+
   } catch (error) {
     if (spinner) spinner.fail(`Failed to list patches: ${error.message}`);
     else console.error(`Failed to list patches: ${error.message}`);
@@ -1844,6 +1960,9 @@ async function setupEnvironment(spinner) {
 async function searchPatches(searchTerm = "") {
   // Get all registered repositories
   const repositories = await getRegisteredRepositories();
+  const verifiedRepos = await fetchVerifiedRepositories();
+  const verifiedRepoMap = new Map(verifiedRepos.map((r) => [r.url, r]));
+
   const results = [];
 
   for (const repo of repositories) {
@@ -1875,9 +1994,11 @@ async function searchPatches(searchTerm = "") {
       // Add to results with remote info
       remoteBranches.forEach((branch) => {
         if (!searchTerm || branch.includes(searchTerm)) {
+          const isVerified = verifiedRepoMap.has(repo.url);
           results.push({
             name: branch,
             remote: repo.name,
+            isVerified,
           });
         }
       });
@@ -2092,259 +2213,133 @@ async function syncPatches(options = {}) {
         }...`;
 
         try {
-          if (patchName.includes("/")) {
-            // Extract the remote and patch name from the namespaced format
-            const parts = patchName.split("/");
-            const remoteName = parts[0];
-            const patchNameOnly = parts.slice(1).join("/");
+          // Require namespaced patches - breaking change
+          if (!patchName.includes("/")) {
+            throw new Error(
+              `Non-namespaced patch "${patchName}" is no longer supported. Please use the format "repository/patchName".`
+            );
+          }
 
-            // Get the tag-compatible name for version checking
-            const tagCompatibleName = getTagCompatibleName(patchName);
+          // Extract the remote and patch name from the namespaced format
+          const parts = patchName.split("/");
+          const remoteName = parts[0];
+          const patchNameOnly = parts.slice(1).join("/");
 
-            // Check if a newer version is available
-            let latestVersion = originalVersion;
-            let shouldUseLatestVersion = false;
+          // Get the tag-compatible name for version checking
+          const tagCompatibleName = getTagCompatibleName(patchName);
 
-            if (originalVersion) {
-              // Check for newer versions
-              const allVersions = await getAvailableVersions(tagCompatibleName);
+          // Check if a newer version is available
+          let latestVersion = originalVersion;
+          let shouldUseLatestVersion = false;
 
-              if (
-                allVersions.length > 0 &&
-                allVersions[0] !== originalVersion
-              ) {
-                latestVersion = allVersions[0];
+          if (originalVersion) {
+            // Check for newer versions
+            const allVersions = await getAvailableVersions(tagCompatibleName);
 
-                // Ask user if they want to update to the newer version or use the interactive option
-                if (!options.nonInteractive) {
-                  spinner.stop(); // Pause spinner for user input
+            if (allVersions.length > 0 && allVersions[0] !== originalVersion) {
+              latestVersion = allVersions[0];
 
-                  const { updateToLatest } = await inquirer.prompt([
-                    {
-                      type: "confirm",
-                      name: "updateToLatest",
-                      message: `Newer version available for ${patchName}: v${latestVersion} (current: v${originalVersion}). Update?`,
-                      default: true,
-                    },
-                  ]);
+              // Ask user if they want to update to the newer version
+              if (!options.nonInteractive) {
+                spinner.stop(); // Pause spinner for user input
 
-                  shouldUseLatestVersion = updateToLatest;
-                  spinner.start(); // Resume spinner
-                } else if (options.autoUpdate) {
-                  // Auto-update if configured
-                  shouldUseLatestVersion = true;
-                  spinner.info(
-                    `Auto-updating ${patchName} from v${originalVersion} to v${latestVersion}`
-                  );
-                } else {
-                  // Default to keeping current version
-                  spinner.info(
-                    `Newer version v${latestVersion} available for ${patchName}, keeping v${originalVersion} (use --auto-update to upgrade)`
-                  );
-                }
+                const { updateToLatest } = await inquirer.prompt([
+                  {
+                    type: "confirm",
+                    name: "updateToLatest",
+                    message: `Newer version available for ${patchName}: v${latestVersion} (current: v${originalVersion}). Update?`,
+                    default: true,
+                  },
+                ]);
+
+                shouldUseLatestVersion = updateToLatest;
+                spinner.start(); // Resume spinner
+              } else if (options.autoUpdate) {
+                // Auto-update if configured
+                shouldUseLatestVersion = true;
+                spinner.info(
+                  `Auto-updating ${patchName} from v${originalVersion} to v${latestVersion}`
+                );
+              } else {
+                // Default to keeping current version
+                spinner.info(
+                  `Newer version v${latestVersion} available for ${patchName}, keeping v${originalVersion} (use --auto-update to upgrade)`
+                );
               }
-            }
-
-            // Determine which version to use
-            const versionToUse = shouldUseLatestVersion
-              ? latestVersion
-              : originalVersion;
-
-            if (versionToUse) {
-              // Handle versioned patch
-              spinner.text = `Applying versioned patch ${patchName} v${versionToUse}...`;
-
-              try {
-                // Apply the changes via cherry-pick but with custom commit
-                await utils.execGit(
-                  [
-                    "cherry-pick",
-                    "-n",
-                    `${tagCompatibleName}-v${versionToUse}`,
-                  ],
-                  "Failed to apply mod version"
-                );
-
-                // Get base branch hash for metadata
-                const baseRemote = await getBaseRemote();
-                const currentBaseBranchHash = await utils.execGit(
-                  ["rev-parse", `${baseRemote}/${baseBranch}`],
-                  "Failed to get current base branch commit hash"
-                );
-
-                // Handle any package changes
-                await utils.handlePackageChanges();
-                await utils.execGit(["add", "."], "Failed to stage changes");
-
-                // Create an enhanced commit message with proper metadata
-                const enhancedCommitMessage =
-                  await generateEnhancedCommitMessage(
-                    patchName,
-                    versionToUse,
-                    originalCommitHash,
-                    modBaseBranchHash,
-                    currentBaseBranchHash
-                  );
-
-                // Commit with the enhanced message
-                await utils.execGit(
-                  ["commit", "-m", enhancedCommitMessage],
-                  "Failed to commit changes"
-                );
-
-                if (shouldUseLatestVersion) {
-                  updatedPatches.push({
-                    name: patchName,
-                    oldVersion: originalVersion,
-                    newVersion: versionToUse,
-                  });
-                }
-              } catch (e) {
-                spinner.warn(
-                  `Failed to apply versioned patch, aborting: ${e.message}`
-                );
-                await utils
-                  .execGit(
-                    ["cherry-pick", "--abort"],
-                    "Failed to abort cherry-pick"
-                  )
-                  .catch(() => {}); // Ignore errors if no cherry-pick in progress
-                throw e;
-              }
-            } else {
-              // Apply non-versioned patch using the robust function
-              const cleanPatchName = patchNameOnly.startsWith("cow_")
-                ? patchNameOnly
-                : `cow_${patchNameOnly}`;
-
-              await applyPatchFromRepo(cleanPatchName, remoteName);
-            }
-          } else {
-            // Legacy non-namespaced patch
-            const cleanPatchName = patchName.startsWith("cow_")
-              ? patchName
-              : `cow_${patchName}`;
-
-            if (originalVersion) {
-              // Check for newer versions first
-              const tagCompatibleName = getTagCompatibleName(
-                `${PATCHES_REMOTE}/${patchName}`
-              );
-
-              // Check if a newer version is available
-              let latestVersion = originalVersion;
-              let shouldUseLatestVersion = false;
-
-              // Check for newer versions
-              const allVersions = await getAvailableVersions(tagCompatibleName);
-
-              if (
-                allVersions.length > 0 &&
-                allVersions[0] !== originalVersion
-              ) {
-                latestVersion = allVersions[0];
-
-                // Ask user if they want to update to the newer version or use the interactive option
-                if (!options.nonInteractive) {
-                  spinner.stop(); // Pause spinner for user input
-
-                  const { updateToLatest } = await inquirer.prompt([
-                    {
-                      type: "confirm",
-                      name: "updateToLatest",
-                      message: `Newer version available for ${patchName}: v${latestVersion} (current: v${originalVersion}). Update?`,
-                      default: true,
-                    },
-                  ]);
-
-                  shouldUseLatestVersion = updateToLatest;
-                  spinner.start(); // Resume spinner
-                } else if (options.autoUpdate) {
-                  // Auto-update if configured
-                  shouldUseLatestVersion = true;
-                  spinner.info(
-                    `Auto-updating ${patchName} from v${originalVersion} to v${latestVersion}`
-                  );
-                } else {
-                  // Default to keeping current version
-                  spinner.info(
-                    `Newer version v${latestVersion} available for ${patchName}, keeping v${originalVersion} (use --auto-update to upgrade)`
-                  );
-                }
-              }
-
-              // Determine which version to use
-              const versionToUse = shouldUseLatestVersion
-                ? latestVersion
-                : originalVersion;
-
-              // Handle legacy versioned patch
-              spinner.text = `Applying legacy versioned patch ${patchName} v${versionToUse}...`;
-
-              try {
-                // Apply the changes via cherry-pick but with custom commit
-                await utils.execGit(
-                  [
-                    "cherry-pick",
-                    "-n",
-                    `${tagCompatibleName}-v${versionToUse}`,
-                  ],
-                  "Failed to apply mod version"
-                );
-
-                // Get base branch hash for metadata
-                const baseRemote = await getBaseRemote();
-                const currentBaseBranchHash = await utils.execGit(
-                  ["rev-parse", `${baseRemote}/${baseBranch}`],
-                  "Failed to get current base branch commit hash"
-                );
-
-                // Handle any package changes
-                await utils.handlePackageChanges();
-                await utils.execGit(["add", "."], "Failed to stage changes");
-
-                // Create an enhanced commit message with proper metadata
-                const enhancedCommitMessage =
-                  await generateEnhancedCommitMessage(
-                    patchName,
-                    versionToUse,
-                    originalCommitHash,
-                    modBaseBranchHash,
-                    currentBaseBranchHash
-                  );
-
-                // Commit with the enhanced message
-                await utils.execGit(
-                  ["commit", "-m", enhancedCommitMessage],
-                  "Failed to commit changes"
-                );
-
-                if (shouldUseLatestVersion) {
-                  updatedPatches.push({
-                    name: patchName,
-                    oldVersion: originalVersion,
-                    newVersion: versionToUse,
-                  });
-                }
-              } catch (e) {
-                spinner.warn(
-                  `Failed to apply versioned patch, aborting: ${e.message}`
-                );
-                await utils
-                  .execGit(
-                    ["cherry-pick", "--abort"],
-                    "Failed to abort cherry-pick"
-                  )
-                  .catch(() => {}); // Ignore errors if no cherry-pick in progress
-                throw e;
-              }
-            } else {
-              // Apply non-versioned legacy patch
-              await applyPatchFromRepo(cleanPatchName, PATCHES_REMOTE);
             }
           }
 
-          await setupEnvironment(spinner);
+          // Determine which version to use
+          const versionToUse = shouldUseLatestVersion
+            ? latestVersion
+            : originalVersion;
+
+          if (versionToUse) {
+            // Handle versioned patch
+            spinner.text = `Applying versioned patch ${patchName} v${versionToUse}...`;
+
+            try {
+              // Apply the changes via cherry-pick but with custom commit
+              await utils.execGit(
+                ["cherry-pick", "-n", `${tagCompatibleName}-v${versionToUse}`],
+                "Failed to apply mod version"
+              );
+
+              // Get base branch hash for metadata
+              const baseRemote = await getBaseRemote();
+              const currentBaseBranchHash = await utils.execGit(
+                ["rev-parse", `${baseRemote}/${baseBranch}`],
+                "Failed to get current base branch commit hash"
+              );
+
+              // Handle any package changes
+              await utils.handlePackageChanges();
+              await utils.execGit(["add", "."], "Failed to stage changes");
+
+              // Create an enhanced commit message with proper metadata
+              const enhancedCommitMessage = await generateEnhancedCommitMessage(
+                patchName,
+                versionToUse,
+                originalCommitHash,
+                modBaseBranchHash,
+                currentBaseBranchHash
+              );
+
+              // Commit with the enhanced message
+              await utils.execGit(
+                ["commit", "-m", enhancedCommitMessage],
+                "Failed to commit changes"
+              );
+
+              if (shouldUseLatestVersion) {
+                updatedPatches.push({
+                  name: patchName,
+                  oldVersion: originalVersion,
+                  newVersion: versionToUse,
+                });
+              }
+            } catch (e) {
+              spinner.warn(
+                `Failed to apply versioned patch, aborting: ${e.message}`
+              );
+              await utils
+                .execGit(
+                  ["cherry-pick", "--abort"],
+                  "Failed to abort cherry-pick"
+                )
+                .catch(() => {}); // Ignore errors if no cherry-pick in progress
+              throw e;
+            }
+          } else {
+            // Apply non-versioned patch using the robust function
+            const cleanPatchName = patchNameOnly.startsWith("cow_")
+              ? patchNameOnly
+              : `cow_${patchNameOnly}`;
+
+            await applyPatchFromRepo(cleanPatchName, remoteName);
+          }
+
+          // await setupEnvironment(spinner);
         } catch (e) {
           spinner.fail(`Failed to reapply ${patchName}: ${e.message}`);
           failedPatches.push({
@@ -2354,6 +2349,7 @@ async function syncPatches(options = {}) {
         }
       }
 
+      // [Rest of the function remains the same...]
       if (failedPatches.length > 0) {
         spinner.warn(
           "Some patches failed to reapply. Restoring original state..."
@@ -2541,7 +2537,7 @@ async function interactiveInstall(options = {}) {
       }
     }
 
-    await setupEnvironment(spinner);
+    // await setupEnvironment(spinner);
 
     if (options.install) {
       spinner.start("Installing dependencies...");
@@ -2739,19 +2735,23 @@ async function getPreferredReleaseRepository(patchName) {
       return repositories[0].name;
     }
 
+    const choices = [];
+    for (let i = 0; i < repositories.length; i++) {
+      const repo = repositories[i];
+      const isVerified = await isVerifiedRepository(repo.name);
+      const verificationBadge = isVerified ? chalk.green(" [✓ Verified]") : "";
+      choices.push({
+        name: `  - ${repo.name}${verificationBadge}: ${repo.url}`,
+        value: repo.name,
+      });
+    }
     // Prompt user to select a repository
     const { selectedRepo } = await inquirer.prompt([
       {
         type: "list",
         name: "selectedRepo",
         message: `Select repository to release ${patchName} to:`,
-        choices: repositories.map((repo) => ({
-          name: `${repo.name}${
-            repo.name === PATCHES_REMOTE ? " (default)" : ""
-          }: ${repo.url}`,
-          value: repo.name,
-        })),
-        default: PATCHES_REMOTE,
+        choices,
       },
     ]);
 
@@ -2780,11 +2780,7 @@ async function getPreferredReleaseRepository(patchName) {
 
     return selectedRepo;
   } catch (error) {
-    log(
-      `Failed to determine repository, using default: ${error.message}`,
-      "warning"
-    );
-    return PATCHES_REMOTE;
+    log(`Failed to determine repository: ${error.message}`, "warning");
   }
 }
 
@@ -3302,12 +3298,26 @@ program
         // Determine the preferred repository interactively
         targetRepo = await getPreferredReleaseRepository(cleanPatchName);
       } else {
-        // Default to the default patches remote
-        targetRepo = PATCHES_REMOTE;
+        // Use a verified repository (instead of defaulting to PATCHES_REMOTE)
+        targetRepo = await getPreferredVerifiedRepository(false);
+
+        if (!targetRepo) {
+          throw new Error(
+            "No verified repositories available. Please specify a repository with '--repository' or run in interactive mode."
+          );
+        }
       }
 
+      // Check if this is a verified repository
+      const repositories = await getRegisteredRepositories();
+      const verifiedRepos = await fetchVerifiedRepositories();
+      const repo = repositories.find((r) => r.name === targetRepo);
+      const isVerified =
+        repo && verifiedRepos.some((vr) => vr.url === repo.url);
+      const verificationBadge = isVerified ? " [✓ Verified]" : "";
+
       const spinner = ora(
-        `Initializing development environment for ${cleanPatchName} (branch: ${devBranch}, target: ${targetRepo})`
+        `Initializing development environment for ${cleanPatchName} (branch: ${devBranch}, target: ${targetRepo}${verificationBadge})`
       ).start();
 
       try {
@@ -3366,10 +3376,11 @@ program
           "Failed to save repository preference"
         );
 
+        // Add verification status to success message
         spinner.succeed(
           `Development environment initialized for ${cleanPatchName}\n` +
             `Branch: ${devBranch}\n` +
-            `Target repository: ${targetRepo}`
+            `Target repository: ${targetRepo}${verificationBadge}`
         );
       } catch (error) {
         spinner.fail(
@@ -4126,8 +4137,8 @@ program
       }
 
       // After all patches have been applied, check for environment variables
-      const spinner = ora("Checking for environment variables...").start();
-      await setupEnvironment(spinner);
+      // const spinner = ora("Checking for environment variables...").start();
+      // await setupEnvironment(spinner);
 
       // Display the list of all applied patches
       await listPatches();
@@ -4256,6 +4267,11 @@ program
         patchesByRepo[patch.remote].push(patch.name);
       }
 
+      // Get repository information for verification badges
+      const repositories = await getRegisteredRepositories();
+      const verifiedRepos = await fetchVerifiedRepositories();
+      const verifiedRepoMap = new Map(verifiedRepos.map((r) => [r.url, r]));
+
       // If a specific mod is searched, show its versions too
       if (patchName) {
         for (const [repo, repoPatches] of Object.entries(patchesByRepo)) {
@@ -4294,9 +4310,8 @@ program
 
             // First show the mod info
             const { author, relativeTime } = await getPatchInfo(patch, repo);
-            // Display with repository prefix if not the default repo
-            const displayName =
-              repo !== PATCHES_REMOTE ? `${repo}/${patch}` : patch;
+            // Display with repository prefix
+            const displayName = `${repo}/${patch}`;
             console.log(chalk.cyan(`  ${displayName}`));
             console.log(`    Author: ${author}`);
             console.log(`    Created: ${relativeTime}`);
@@ -4322,12 +4337,19 @@ program
       } else {
         // Show all patches organized by repository
         for (const [repo, repoPatches] of Object.entries(patchesByRepo)) {
-          // Display repository header
-          console.log(
-            chalk.blue(
-              `\n${repo}${repo === PATCHES_REMOTE ? " (default)" : ""}:`
-            )
-          );
+          // Find this repository in our list to get its URL
+          const repoObj = repositories.find((r) => r.name === repo);
+          const isVerified = repoObj && verifiedRepoMap.has(repoObj.url);
+
+          // Create verification badge if repository is verified
+          const verifiedBadge = isVerified
+            ? chalk.green(
+                ` [✓ Verified]`
+              )
+            : "";
+
+          // Display repository header with verification status
+          console.log(chalk.blue(`\n${repo}:${verifiedBadge}`));
 
           // Show patches from this repository
           for (const patch of repoPatches) {
