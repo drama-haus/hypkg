@@ -34,11 +34,12 @@ async function fetchVerifiedRepositories() {
   try {
     // These values would need to be updated with actual GitHub repo details
     const owner = "drama-haus";
-    const repo = "hyp-studio";
-    const path = "forks.json";
+    const repo = "hyperfy_core_overwrites";
+    const path = "repos.json";
 
     const response = await fetch(
       `https://raw.githubusercontent.com/${owner}/${repo}/main/${path}`,
+
       { timeout: 5000 }
     );
 
@@ -816,9 +817,7 @@ async function listRepositories() {
     } else {
       repositories.forEach((repo) => {
         const verifiedInfo = verifiedRepoMap.has(repo.url)
-          ? chalk.green(
-              ` [✓ Verified]`
-            )
+          ? chalk.green(` [✓ Verified]`)
           : "";
         console.log(`  - ${repo.name}: ${repo.url}${verifiedInfo}`);
       });
@@ -1656,7 +1655,6 @@ async function listPatches() {
         )
       );
     }
-
   } catch (error) {
     if (spinner) spinner.fail(`Failed to list patches: ${error.message}`);
     else console.error(`Failed to list patches: ${error.message}`);
@@ -4342,11 +4340,7 @@ program
           const isVerified = repoObj && verifiedRepoMap.has(repoObj.url);
 
           // Create verification badge if repository is verified
-          const verifiedBadge = isVerified
-            ? chalk.green(
-                ` [✓ Verified]`
-              )
-            : "";
+          const verifiedBadge = isVerified ? chalk.green(` [✓ Verified]`) : "";
 
           // Display repository header with verification status
           console.log(chalk.blue(`\n${repo}:${verifiedBadge}`));
