@@ -1,6 +1,6 @@
 {
   "name": "hypkg",
-  "version": "0.0.28",
+  "version": "0.0.29",
   "description": "Apply patches from hyperfy user branches",
   "bin": {
     "hypkg": "bin/wrapper.js"
