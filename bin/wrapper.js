@@ -44,7 +44,7 @@ async function findLocalCLI(gitRoot) {
     const cliPath = path.join(
       gitRoot,
       "node_modules",
-      "hucow",
+      "hypkg",
       "bin",
       "cli.js"
     );
@@ -52,7 +52,7 @@ async function findLocalCLI(gitRoot) {
     return cliPath;
   } catch (e) {
     throw new Error(
-      "hucow is not installed in this project. Please run: npx hucow"
+      "hypkg is not installed in this project. Please run: npx hypkg"
     );
   }
 }
@@ -72,7 +72,7 @@ async function main() {
       return;
     }
 
-    // For direct hucow command, check repo and show usage
+    // For direct hypkg command, check repo and show usage
     const gitRoot = await findGitRoot();
     await verifyGameEngineRepo(gitRoot);
     const cliPath = await findLocalCLI(gitRoot);
