@@ -261,113 +261,6 @@ async function handlePackageChanges() {
   }
 }
 
-// Time utilities
-function getRelativeTime(timestamp) {
-  const diff = Date.now() - timestamp;
-  const seconds = Math.floor(diff / 1000);
-  const minutes = Math.floor(seconds / 60);
-  const hours = Math.floor(minutes / 60);
-  const days = Math.floor(hours / 24);
-  const weeks = Math.floor(days / 7);
-  const months = Math.floor(days / 30);
-  const years = Math.floor(days / 365);
-
-  if (years > 0) return `${years}y ago`;
-  if (months > 0) return `${months}mo ago`;
-  if (weeks > 0) return `${weeks}w ago`;
-  if (days > 0) return `${days}d ago`;
-  if (hours > 0) return `${hours}h ago`;
-  if (minutes > 0) return `${minutes}m ago`;
-  return `${seconds}s ago`;
-}
-
-// Patch management
-async function getPatchInfo(branchName, patchesRemote) {
-  const fullBranchName = `${patchesRemote}/cow_${branchName}`;
-  const commitInfo = await execGit(
-    ["log", "-1", "--format=%an|%at", fullBranchName],
-    `Failed to get commit info for ${branchName}`
-  );
-
-  const [author, timestamp] = commitInfo.split("|");
-  const relativeTime = getRelativeTime(parseInt(timestamp) * 1000);
-
-  return {
-    author,
-    relativeTime,
-  };
-}
-
-async function searchPatches(patchesRemote, searchTerm = "") {
-  await execGit(["remote", "update", patchesRemote, "--prune"]);
-
-  const branches = await execGit(
-    ["branch", "-a"],
-    "Failed to list all branches"
-  );
-
-  const remoteBranches = branches
-    .split("\n")
-    .map((b) => b.trim())
-    .filter((b) => b.startsWith(`remotes/${patchesRemote}/cow_`))
-    .map((b) => b.replace(`remotes/${patchesRemote}/`, ""))
-    .map((b) => b.replace(`cow_`, ""));
-
-  if (searchTerm) {
-    return remoteBranches.filter((b) => b.includes(searchTerm));
-  }
-  return remoteBranches;
-}
-
-// Hyp file utilities
-function ab2str(buf) {
-  return String.fromCharCode.apply(null, buf);
-}
-
-async function extractHypFile(filePath) {
-  try {
-    const buffer = await fs.readFile(filePath);
-    const view = new DataView(buffer.buffer);
-    const headerSize = view.getUint32(0, true);
-    const headerBytes = new Uint8Array(buffer.buffer.slice(4, 4 + headerSize));
-    const header = JSON.parse(ab2str(headerBytes));
-    const baseDir = path.basename(filePath, ".hyp");
-
-    await fs.mkdir(baseDir, { recursive: true });
-    let position = 4 + headerSize;
-
-    console.log(`Extracting files from ${filePath}...`);
-    console.log(`Found ${header.assets.length} assets:`);
-
-    for (const assetInfo of header.assets) {
-      const data = buffer.slice(position, position + assetInfo.size);
-      const fileName = assetInfo.url.split("/").pop();
-      const outputPath = path.join(baseDir, fileName);
-
-      await fs.writeFile(outputPath, data);
-      console.log(`- ${fileName} (${assetInfo.type}): ${assetInfo.size} bytes`);
-
-      position += assetInfo.size;
-    }
-
-    const blueprintPath = path.join(baseDir, "blueprint.json");
-    await fs.writeFile(
-      blueprintPath,
-      JSON.stringify(header.blueprint, null, 2)
-    );
-    console.log(`- blueprint.json: Blueprint data`);
-    console.log(`\nFiles extracted to ./${baseDir}/`);
-
-    return {
-      assets: header.assets,
-      blueprint: header.blueprint,
-      extractedPath: baseDir,
-    };
-  } catch (error) {
-    throw new Error(`Error extracting .hyp file: ${error.message}`);
-  }
-}
-
 module.exports = {
   // Git utilities
   execGit,
@@ -388,16 +281,6 @@ module.exports = {
   // Package management
   handlePackageChanges,
 
-  // Patch management
-  getPatchInfo,
-  searchPatches,
-
-  // File utilities
-  extractHypFile,
-
   // Logging utilities
   log,
-
-  // Time utilities
-  getRelativeTime,
 };

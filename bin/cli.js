@@ -136,30 +136,6 @@ function getTagCompatibleName(patchName) {
 }
 
 /**
- * Extract repository and patch name from a tag-compatible name
- * @param {string} tagName - The tag name without version suffix
- * @returns {Object} - Object with repository and patchName
- */
-function parseTagCompatibleName(tagName) {
-  // If there's no hyphen, it's a non-namespaced patch
-  if (!tagName.includes("-")) {
-    // For backward compatibility, we'll need to interactively select
-    // or use the first verified repository
-    // This will need to be async, which may require refactoring callers
-    throw new Error(
-      "Non-namespaced patches are no longer supported. Please use 'repository/patchName' format."
-    );
-  }
-
-  // Split on first hyphen to get repo and patch parts
-  const firstHyphen = tagName.indexOf("-");
-  const repository = tagName.substring(0, firstHyphen);
-  const patchName = tagName.substring(firstHyphen + 1);
-
-  return { repository, patchName };
-}
-
-/**
  * Get the associated patch name for a branch
  * This first checks git config to see if a mapping exists,
  * then falls back to naming conventions
@@ -185,9 +161,7 @@ async function getPatchNameForBranch(branchName) {
     }
 
     // Check for legacy naming conventions
-    if (branchName.startsWith("dev_cow_")) {
-      return branchName.replace("dev_cow_", "");
-    } else if (branchName.startsWith("cow_")) {
+    if (branchName.startsWith("cow_")) {
       return branchName.replace("cow_", "");
     }
 
@@ -2114,26 +2088,7 @@ async function syncPatches(options = {}) {
     const currentBranch = await utils.getCurrentBranch();
     const baseBranch = await utils.getBaseBranch();
 
-    // Check if we're on a dev, cow_, or dev_cow_ branch
-    if (currentBranch.startsWith("dev_cow_")) {
-      spinner.fail(
-        `Cannot run sync on a development branch (${currentBranch})`
-      );
-      log(
-        "The sync command should not be run on development branches.",
-        "error"
-      );
-      log(
-        "These branches are used for mod development and would be reset by sync.",
-        "warning"
-      );
-      log(
-        "Please checkout your main feature branch before running this command.",
-        "info"
-      );
-      return;
-    }
-
+    // Check if we're on a cow_ branch
     if (currentBranch.startsWith("cow_")) {
       spinner.fail(`Cannot run sync on a patch branch (${currentBranch})`);
       log("The sync command should not be run on patch branches.", "error");
@@ -2143,6 +2098,36 @@ async function syncPatches(options = {}) {
         "info"
       );
       return;
+    }
+
+    // Check if we're on a mod development branch by checking git config
+    try {
+      const configKey = `hyperfy.mod.${currentBranch}.patchName`;
+      const configuredPatchName = await utils.execGit(
+        ["config", "--get", configKey],
+        "Failed to get patch name from git config"
+      );
+
+      if (configuredPatchName && configuredPatchName.trim()) {
+        spinner.fail(
+          `Cannot run sync on a mod development branch (${currentBranch})`
+        );
+        log(
+          "The sync command should not be run on mod development branches.",
+          "error"
+        );
+        log(
+          `Branch '${currentBranch}' is registered as a development branch for mod '${configuredPatchName.trim()}'.`,
+          "warning"
+        );
+        log(
+          "Please checkout your main feature branch before running this command.",
+          "info"
+        );
+        return;
+      }
+    } catch (error) {
+      // Git config not set, continue with other checks
     }
 
     if (["dev", "develop", "development"].includes(currentBranch)) {
@@ -3264,135 +3249,6 @@ program
   .description("Interactive setup of a hyperfy world")
   .option("--no-install", "Skip npm install and server startup")
   .action((options) => interactiveInstall(options));
-
-program
-  .command("init <patchName>")
-  .description("Initialize a new mod development environment")
-  .option("-r, --repository <repository>", "Target repository for development")
-  .option(
-    "-b, --branch <branchName>",
-    "Custom branch name for development (defaults to patchName)"
-  )
-  .action(async (patchName, options) => {
-    try {
-      // Clean up the patch name (remove cow_ prefix if present)
-      const cleanPatchName = patchName.replace(/^cow_/, "");
-
-      // Use custom branch name if provided, otherwise use the patch name
-      const devBranch = options.branch || cleanPatchName;
-
-      // Determine target repository
-      let targetRepo;
-      if (options.repository) {
-        // Verify the specified repository exists
-        const repositories = await getRegisteredRepositories();
-        if (!repositories.some((repo) => repo.name === options.repository)) {
-          throw new Error(
-            `Repository '${options.repository}' is not registered. Use 'repository add' to add it first.`
-          );
-        }
-        targetRepo = options.repository;
-      } else if (!options.nonInteractive) {
-        // Determine the preferred repository interactively
-        targetRepo = await getPreferredReleaseRepository(cleanPatchName);
-      } else {
-        // Use a verified repository (instead of defaulting to PATCHES_REMOTE)
-        targetRepo = await getPreferredVerifiedRepository(false);
-
-        if (!targetRepo) {
-          throw new Error(
-            "No verified repositories available. Please specify a repository with '--repository' or run in interactive mode."
-          );
-        }
-      }
-
-      // Check if this is a verified repository
-      const repositories = await getRegisteredRepositories();
-      const verifiedRepos = await fetchVerifiedRepositories();
-      const repo = repositories.find((r) => r.name === targetRepo);
-      const isVerified =
-        repo && verifiedRepos.some((vr) => vr.url === repo.url);
-      const verificationBadge = isVerified ? " [✓ Verified]" : "";
-
-      const spinner = ora(
-        `Initializing development environment for ${cleanPatchName} (branch: ${devBranch}, target: ${targetRepo}${verificationBadge})`
-      ).start();
-
-      try {
-        const baseBranch = await utils.getBaseBranch();
-        const baseRemote = await getBaseRemote();
-
-        // Fetch latest changes from the appropriate remote
-        spinner.text = `Fetching latest changes from ${baseRemote}...`;
-        await utils.execGit(
-          ["fetch", baseRemote],
-          `Failed to fetch updates from ${baseRemote}`
-        );
-
-        // Also fetch from target repository if different
-        if (targetRepo !== baseRemote) {
-          spinner.text = `Fetching latest changes from ${targetRepo}...`;
-          await utils.execGit(
-            ["fetch", targetRepo],
-            `Failed to fetch updates from ${targetRepo}`
-          );
-        }
-
-        // Check if the branch already exists
-        const branches = await utils.execGit(
-          ["branch"],
-          "Failed to list branches"
-        );
-
-        if (!branches.includes(devBranch)) {
-          // Use the proper remote reference for the base branch
-          spinner.text = `Creating new branch ${devBranch} from ${baseRemote}/${baseBranch}...`;
-          await utils.execGit(
-            ["checkout", "-b", devBranch, `${baseRemote}/${baseBranch}`],
-            "Failed to create dev branch"
-          );
-        } else {
-          spinner.text = `Checking out existing branch ${devBranch}...`;
-          await utils.execGit(
-            ["checkout", devBranch],
-            "Failed to checkout dev branch"
-          );
-        }
-
-        // Store the target repository and patch name in git config
-        // This allows us to remember which patch this branch is for
-        const configKey = `hyperfy.mod.${devBranch}.patchName`;
-        await utils.execGit(
-          ["config", configKey, cleanPatchName],
-          "Failed to save patch name"
-        );
-
-        // Store the target repository in git config
-        const repoConfigKey = `hyperfy.mod.${cleanPatchName}.repository`;
-        await utils.execGit(
-          ["config", repoConfigKey, targetRepo],
-          "Failed to save repository preference"
-        );
-
-        // Add verification status to success message
-        spinner.succeed(
-          `Development environment initialized for ${cleanPatchName}\n` +
-            `Branch: ${devBranch}\n` +
-            `Target repository: ${targetRepo}${verificationBadge}`
-        );
-      } catch (error) {
-        spinner.fail(
-          `Failed to initialize development environment: ${error.message}`
-        );
-        throw error;
-      }
-    } catch (e) {
-      console.error(
-        `Failed to initialize development environment: ${e.message}`
-      );
-      process.exit(1);
-    }
-  });
 
 program
   .command("update [branchName]")
