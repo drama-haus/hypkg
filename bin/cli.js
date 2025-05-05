@@ -4,7 +4,7 @@ const DEBUG = false;
 
 // Import the new Git utilities
 const git = require("../src/lib/git");
-const { GIT, CLI } = require("../src/lib/constants");
+const { GIT } = require("../src/lib/constants");
 const {
   GitOperationError,
   GitCommandError,
@@ -36,6 +36,8 @@ const {
 const { searchPatches } = require("./searchPatches");
 const { getPatchInfo } = require("./getPatchInfo");
 const { fetchVerifiedRepositories, isVerifiedRepository } = require("./fetchVerifiedRepositories");
+const { applyPatchFromRepo } = require("./applyPatchFromRepo");
+const { log } = require("./log");
 const config = {
   patchesRepo: packageJson.config.patchesRepo,
   patchesRemote: packageJson.config.patchesRemoteName,
@@ -47,19 +49,6 @@ const TARGET_REPO = packageJson.config.targetRepo;
 exports.TARGET_REPO = TARGET_REPO;
 const PACKAGE_NAME = packageJson.name;
 let BRANCH_NAME = PACKAGE_NAME;
-
-// Utility function for consistent logging
-function log(message, type = "info") {
-  const prefix = {
-    info: chalk.blue(CLI.LOG_PREFIXES.INFO),
-    success: chalk.green(CLI.LOG_PREFIXES.SUCCESS),
-    warning: chalk.yellow(CLI.LOG_PREFIXES.WARNING),
-    error: chalk.red(CLI.LOG_PREFIXES.ERROR),
-    step: chalk.cyan(CLI.LOG_PREFIXES.STEP),
-  }[type];
-
-  console.log(`${prefix} ${message}`);
-}
 
 /**
  * Get the associated patch name for a branch
@@ -640,209 +629,6 @@ async function ensureValidProject(options = {}) {
   }
 }
 
-// Extract version from commit message if it exists
-function extractVersionFromMessage(message) {
-  const versionMatch = message.match(/v(\d+\.\d+\.\d+)/);
-  if (versionMatch) {
-    return versionMatch[1];
-  }
-  return null;
-}
-
-/**
- * Applies a patch from a specific repository with mandatory namespacing
- * @param {string} patchName - Name of the patch
- * @param {string} remoteName - Name of the remote
- * @returns {Promise<void>}
- */
-async function applyPatchFromRepo(patchName, remoteName) {
-  const spinner = ora(`Applying mod: ${patchName} from ${remoteName}`).start();
-  const appliedPatches = await utils.getAppliedPatches();
-
-  // Clean up the patch name (remove cow_ prefix if present)
-  const cleanPatchName = patchName.replace(/^cow_/, "");
-
-  // Always namespace the patch with the remote name
-  const namespacedPatchName = `${remoteName}/${cleanPatchName}`;
-
-  // Check if patch is already applied (considering namespace)
-  if (
-    appliedPatches.some((p) => {
-      const name = typeof p === "string" ? p : p.name;
-      return name === namespacedPatchName;
-    })
-  ) {
-    spinner.info(`Patch ${namespacedPatchName} is already applied`);
-    return;
-  }
-
-  const initialState = await utils.saveGitState();
-
-  try {
-    spinner.text = "Finding mod commit...";
-
-    // Format the branch name correctly for this remote
-    const remoteBranchName = `cow_${cleanPatchName}`;
-
-    // Get the original commit hash and message from the remote branch
-    const originalCommitHash = await utils.execGit(
-      ["rev-parse", `${remoteName}/${remoteBranchName}`],
-      `Failed to find commit hash for mod ${cleanPatchName} from ${remoteName}`
-    );
-
-    const commitMessage = await utils.execGit(
-      ["log", "-1", "--format=%B", originalCommitHash],
-      `Failed to get commit message for mod ${cleanPatchName} from ${remoteName}`
-    );
-
-    // Get current base branch hash
-    const baseBranch = await utils.getBaseBranch();
-    const baseRemote = await git.getBaseRemote();
-    const currentBaseBranchHash = await utils.execGit(
-      ["rev-parse", `${baseRemote}/${baseBranch}`],
-      "Failed to get current base branch commit hash"
-    );
-
-    // Try to extract mod base branch hash from the original commit message
-    let modBaseBranchHash = null;
-    const parsedMessage = git.parseEnhancedCommitMessage(commitMessage);
-
-    if (
-      parsedMessage &&
-      parsedMessage.currentBaseBranchHash &&
-      parsedMessage.currentBaseBranchHash !== "unknown"
-    ) {
-      // If the original commit has metadata, use its current-base as our mod-base
-      modBaseBranchHash = parsedMessage.currentBaseBranchHash;
-    } else if (
-      parsedMessage &&
-      parsedMessage.modBaseBranchHash &&
-      parsedMessage.modBaseBranchHash !== "unknown"
-    ) {
-      // Or use mod-base if available
-      modBaseBranchHash = parsedMessage.modBaseBranchHash;
-    } else {
-      // For patches without enhanced metadata, we'll use the commit's parent
-      try {
-        // Try to find the parent commit that the mod was based on
-        const parentHash = await utils.execGit(
-          ["rev-list", "--parents", "-n", "1", originalCommitHash],
-          "Failed to get parent commit"
-        );
-
-        // The format is: <commit> <parent1> <parent2> ...
-        const parents = parentHash.split(" ");
-        if (parents.length > 1) {
-          // Use the first parent as the base hash
-          modBaseBranchHash = parents[1];
-        } else {
-          // Fallback to current base branch hash if we can't determine
-          modBaseBranchHash = currentBaseBranchHash;
-        }
-      } catch (e) {
-        // If all else fails, use current base branch hash
-        modBaseBranchHash = currentBaseBranchHash;
-      }
-    }
-
-    // Get the version if it's in the commit message
-    const version = extractVersionFromMessage(commitMessage);
-
-    const commit = await utils.execGit(
-      ["rev-list", "-n", "1", `${remoteName}/${remoteBranchName}`, "^HEAD"],
-      `Failed to find commit for mod ${cleanPatchName} from ${remoteName}`
-    );
-
-    if (!commit) {
-      spinner.fail(
-        `No unique commits found in ${cleanPatchName} from ${remoteName}`
-      );
-      throw new Error(
-        `No unique commits found in ${cleanPatchName} from ${remoteName}`
-      );
-    }
-
-    try {
-      spinner.text = "Applying mod changes...";
-      await utils.execGit(
-        ["cherry-pick", commit],
-        "Failed to cherry-pick commit"
-      );
-
-      // Generate enhanced commit message with metadata
-      const enhancedCommitMessage = await git.generateEnhancedCommitMessage(
-        namespacedPatchName,
-        version,
-        originalCommitHash,
-        modBaseBranchHash,
-        currentBaseBranchHash
-      );
-
-      // Update commit message with enhanced metadata
-      await utils.execGit(
-        ["commit", "--amend", "-m", enhancedCommitMessage],
-        "Failed to update commit message"
-      );
-
-      spinner.succeed(`Successfully applied mod: ${namespacedPatchName}`);
-    } catch (cherryPickError) {
-      spinner.warn("Cherry-pick failed, attempting alternative approach...");
-
-      await utils.execGit(
-        ["cherry-pick", "--abort"],
-        "Failed to abort cherry-pick"
-      );
-      
-      try {
-        await utils.execGit(
-          ["cherry-pick", "-n", commit],
-          "Failed to cherry-pick commit"
-        );
-      } catch (noCommitError) {
-        // This is expected - cherry-pick -n will still show conflicts
-      }
-
-      spinner.text = "Handling package dependencies...";
-      const handledLockConflict = await utils.handlePackageChanges(commit);
-
-      if (!handledLockConflict) {
-        const hasOtherConflicts = await utils.execGit(
-          ["diff", "--name-only", "--diff-filter=U"],
-          "Failed to check conflicts"
-        );
-
-        if (hasOtherConflicts) {
-          spinner.fail("Merge conflicts detected");
-          throw new Error(
-            "Merge conflicts detected in files other than package-lock.json"
-          );
-        }
-      }
-
-      spinner.text = "Committing changes...";
-      await utils.execGit(["add", "."], "Failed to stage changes");
-
-      // Generate enhanced commit message with metadata
-      const enhancedCommitMessage = await git.generateEnhancedCommitMessage(
-        namespacedPatchName,
-        version,
-        originalCommitHash,
-        modBaseBranchHash,
-        currentBaseBranchHash
-      );
-
-      await utils.execGit(
-        ["commit", "-m", enhancedCommitMessage],
-        "Failed to commit changes"
-      );
-    }
-  } catch (error) {
-    spinner.fail(`Failed to apply mod: ${error.message}`);
-    log("Rolling back to initial state...", "warning");
-    await utils.restoreGitState(initialState);
-    throw error;
-  }
-}
 /**
  * Parse a patch name that must include a repository prefix
  * Modified version that requires a repository prefix
@@ -2013,23 +1799,6 @@ async function hasSignificantChanges() {
 }
 
 /**
- * Stash any uncommitted changes
- * @returns {Promise<boolean>} - True if changes were stashed
- */
-async function stashChanges() {
-  return git.stashChanges("Auto-stashed before patch update");
-}
-
-/**
- * Pop stashed changes if they exist
- * @param {boolean} wasStashed - Whether changes were stashed before
- */
-async function popStashedChanges(wasStashed) {
-  if (!wasStashed) return;
-  return git.popStashedChanges();
-}
-
-/**
  * Get the preferred repository for releasing a mod
  * First checks git config, then falls back to interactive selection
  * @param {string} patchName - Name of the patch
@@ -2145,7 +1914,7 @@ async function updateBranch(branchName, options = {}) {
 
     // Stash any uncommitted changes
     spinner.text = "Checking for uncommitted changes...";
-    changesStashed = await stashChanges();
+    changesStashed = await git.stashChanges();
     if (changesStashed) {
       spinner.info("Uncommitted changes stashed");
     }
@@ -2194,7 +1963,7 @@ async function updateBranch(branchName, options = {}) {
 
           // Restore stashed changes
           if (changesStashed) {
-            await popStashedChanges(changesStashed);
+            await git.popStashedChanges(changesStashed);
           }
 
           throw new Error(
@@ -2237,7 +2006,7 @@ async function updateBranch(branchName, options = {}) {
     // Restore stashed changes if any
     if (changesStashed) {
       spinner.text = "Restoring stashed changes...";
-      await popStashedChanges(changesStashed);
+      await git.popStashedChanges(changesStashed);
       spinner.succeed("Stashed changes restored");
     }
 
@@ -2259,7 +2028,7 @@ async function updateBranch(branchName, options = {}) {
     // Restore stashed changes if any
     if (changesStashed) {
       spinner.text = "Restoring stashed changes...";
-      await popStashedChanges(changesStashed);
+      await git.popStashedChanges(changesStashed);
       spinner.info("Stashed changes restored");
     }
 
@@ -3285,31 +3054,3 @@ program.hook("preAction", async (thisCommand, actionCommand) => {
 });
 
 program.parse();
-
-/**
- * Verify repo
- * @param {string} targetRepo - Target repository URL to verify against
- * @returns {Promise<void>}
- */
-async function verifyRepo(targetRepo) {
-  return git.verifyRepo(targetRepo);
-}
-
-/**
- * Set up patches remote
- * @param {string} patchesRepo - URL of the patches repository
- * @param {string} patchesRemote - Name for the patches remote
- * @returns {Promise<void>}
- */
-async function setupPatchesRemote(patchesRepo, patchesRemote) {
-  return git.setupPatchesRemote(patchesRepo, patchesRemote);
-}
-
-// Git state management
-async function saveGitState() {
-  return git.saveGitState();
-}
-
-async function restoreGitState(state) {
-  return git.restoreGitState(state);
-}
