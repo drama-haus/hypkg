@@ -6,19 +6,26 @@
     "hypkg": "bin/wrapper.js"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "jest",
+    "test:e2e": "jest tests/e2e",
+    "test:watch": "jest --watch"
   },
   "author": "itspeezy",
   "license": "GPL-3.0-only",
   "dependencies": {
     "commander": "^11.0.0",
     "dotenv": "^16.4.7",
-    "execa": "^5.1.1",
     "inquirer": "^8.2.6"
   },
   "config": {
     "patchesRepo": "https://github.com/drama-haus/hyperfy",
     "patchesRemoteName": "drama.haus",
     "targetRepo": "https://github.com/hyperfy-xyz/hyperfy"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.14",
+    "execa": "^5.1.1",
+    "jest": "^29.7.0",
+    "tmp-promise": "^3.0.3"
   }
 }

@@ -56,48 +56,6 @@ async function fetchVerifiedRepositories() {
 }
 
 /**
- * Get the first verified repository or prompt user to select one
- * @param {boolean} interactive - Whether to allow interactive selection
- * @returns {Promise<string|null>} - Repository name or null if none available
- */
-async function getPreferredVerifiedRepository(interactive = true) {
-  const verifiedRepos = await fetchVerifiedRepositories();
-  const repositories = await getRegisteredRepositories();
-
-  // Map URLs to repo names
-  const verifiedRepoNames = new Set();
-  for (const vRepo of verifiedRepos) {
-    for (const repo of repositories) {
-      if (repo.url === vRepo.url) {
-        verifiedRepoNames.add(repo.name);
-      }
-    }
-  }
-
-  const verifiedNames = Array.from(verifiedRepoNames);
-
-  if (verifiedNames.length === 0) {
-    return null;
-  }
-
-  if (verifiedNames.length === 1 || !interactive) {
-    return verifiedNames[0];
-  }
-
-  // Interactive selection
-  const { selectedRepo } = await inquirer.prompt([
-    {
-      type: "list",
-      name: "selectedRepo",
-      message: "Select a verified repository:",
-      choices: verifiedNames,
-    },
-  ]);
-
-  return selectedRepo;
-}
-
-/**
  * Check if a repository is verified
  * @param {string} repoName - Name of the repository
  * @returns {Promise<boolean>} - Whether the repository is verified
@@ -3523,6 +3481,20 @@ program
         );
         throw new Error(
           "Please use a feature branch for releases, not a base branch"
+        );
+      }
+
+      // First, update the source branch with the latest base branch changes
+      // This ensures we catch and handle rebase conflicts early
+      spinner.text = `Updating ${sourceBranch} with latest base branch changes...`;
+      try {
+        await updateBranch(sourceBranch, { ...options, nonInteractive: true });
+        spinner.succeed(`Updated ${sourceBranch} with latest base branch changes`);
+        spinner.start(`Proceeding with release...`);
+      } catch (updateError) {
+        spinner.fail(`Failed to update branch: ${updateError.message}`);
+        throw new Error(
+          `Cannot proceed with release until branch is updated with latest base branch changes. Please resolve conflicts and try again.`
         );
       }
 
