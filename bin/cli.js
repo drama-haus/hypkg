@@ -792,13 +792,18 @@ async function applyPatchFromRepo(patchName, remoteName) {
         ["cherry-pick", "--abort"],
         "Failed to abort cherry-pick"
       );
-      await utils.execGit(
-        ["cherry-pick", "-n", commit],
-        "Failed to cherry-pick commit"
-      );
+      
+      try {
+        await utils.execGit(
+          ["cherry-pick", "-n", commit],
+          "Failed to cherry-pick commit"
+        );
+      } catch (noCommitError) {
+        // This is expected - cherry-pick -n will still show conflicts
+      }
 
       spinner.text = "Handling package dependencies...";
-      const handledLockConflict = await utils.handlePackageChanges();
+      const handledLockConflict = await utils.handlePackageChanges(commit);
 
       if (!handledLockConflict) {
         const hasOtherConflicts = await utils.execGit(
