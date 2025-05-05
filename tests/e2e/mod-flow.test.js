@@ -59,10 +59,11 @@ describe('Mod Application and Removal Flow', () => {
   test('should apply and remove a mod successfully', async () => {
     // Create a test mod repository
     const modRepoDir = await getTempDir({ unsafeCleanup: true });
-    await execa('git', ['init'], { cwd: modRepoDir.path });
+    // await execa('git', ['init'], { cwd: modRepoDir.path });
     
     // Apply the mod
     const applyResult = await execa(hypkgBin, ['apply', 'drama-haus/ai']);
+    console.log(applyResult.stdout);
     expect(applyResult.exitCode).toBe(0);
     
     // Verify mod was applied
