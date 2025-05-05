@@ -5,15 +5,15 @@ const DEBUG = false;
 // Import the new Git utilities
 const git = require("../src/lib/git");
 const { GIT, CLI } = require("../src/lib/constants");
-const { 
-  GitOperationError, 
-  GitCommandError, 
-  PatchNotFoundError, 
-  RepositoryError 
+const {
+  GitOperationError,
+  GitCommandError,
+  PatchNotFoundError,
+  RepositoryError,
 } = require("../src/lib/errors");
 
 // Keep original utils for now - we'll gradually migrate
-const utils = require("../utils");
+const utils = require("../src/utils");
 
 const { program, Command } = require("commander");
 const execa = require("execa");
@@ -26,6 +26,16 @@ const fs = require("fs").promises;
 const dotenv = require("dotenv");
 
 const packageJson = require("../package.json");
+const {
+  promptForAction,
+  promptForNewProject,
+  promptForBranch,
+  promptForPatches,
+  promptForEnvVariables
+} = require("../src/lib/prompts");
+const { searchPatches } = require("./searchPatches");
+const { getPatchInfo } = require("./getPatchInfo");
+const { fetchVerifiedRepositories, isVerifiedRepository } = require("./fetchVerifiedRepositories");
 const config = {
   patchesRepo: packageJson.config.patchesRepo,
   patchesRemote: packageJson.config.patchesRemoteName,
@@ -34,52 +44,9 @@ const config = {
 };
 
 const TARGET_REPO = packageJson.config.targetRepo;
+exports.TARGET_REPO = TARGET_REPO;
 const PACKAGE_NAME = packageJson.name;
 let BRANCH_NAME = PACKAGE_NAME;
-
-/**
- * Fetch verified repositories from GitHub
- * @returns {Promise<Array<{url: string, name: string, owner: string}>>}
- */
-async function fetchVerifiedRepositories() {
-  try {
-    // These values would need to be updated with actual GitHub repo details
-    const owner = "drama-haus";
-    const repo = "hyperfy_core_overwrites";
-    const path = "repos.json";
-
-    const response = await fetch(
-      `https://raw.githubusercontent.com/${owner}/${repo}/main/${path}`,
-
-      { timeout: 5000 }
-    );
-
-    if (!response.ok) {
-      console.warn(`Failed to fetch verified repositories: ${response.status}`);
-      return [];
-    }
-
-    return await response.json();
-  } catch (error) {
-    console.warn(`Error fetching verified repositories: ${error.message}`);
-    return [];
-  }
-}
-
-/**
- * Check if a repository is verified
- * @param {string} repoName - Name of the repository
- * @returns {Promise<boolean>} - Whether the repository is verified
- */
-async function isVerifiedRepository(repoName) {
-  const verifiedRepos = await fetchVerifiedRepositories();
-  const repositories = await git.getRegisteredRepositories();
-  const repo = repositories.find((r) => r.name === repoName);
-
-  if (!repo) return false;
-
-  return verifiedRepos.some((vr) => vr.url === repo.url);
-}
 
 // Utility function for consistent logging
 function log(message, type = "info") {
@@ -135,7 +102,6 @@ async function getPatchNameForBranch(branchName) {
   }
 }
 
-
 /**
  * Get the preferred repository for a patch
  * This simplifies the repository selection logic and can be
@@ -157,7 +123,7 @@ async function getRepositoryForPatch(patchName, interactive = true) {
 
       if (configuredRepo && configuredRepo.trim()) {
         // Verify the repository exists
-        const repositories = await getRegisteredRepositories();
+        const repositories = await git.getRegisteredRepositories();
         if (repositories.some((repo) => repo.name === configuredRepo.trim())) {
           return configuredRepo.trim();
         }
@@ -290,57 +256,6 @@ async function ensureNotOnBaseBranch() {
     log(`Branch validation failed: ${error.message}`, "error");
     return false;
   }
-}
-
-/**
- * Get the appropriate base repository remote based on origin configuration
- * This will return 'hyperfy' if origin is not pointing to the canonical repository
- * @returns {string} - The remote name to use for base branch operations
- */
-async function getBaseRemote() {
-  return git.getBaseRemote(TARGET_REPO);
-}
-
-/**
- * Generates an enhanced commit message with metadata
- * @param {string} patchName - Name of the patch
- * @param {string} version - Version of the patch (optional)
- * @param {string} originalCommitHash - Original commit hash of the mod release
- * @param {string} modBaseBranchHash - Base branch commit hash when the mod was created
- * @param {string} currentBaseBranchHash - Current base branch commit hash
- * @returns {Promise<string>} - The enhanced commit message
- */
-async function generateEnhancedCommitMessage(
-  patchName,
-  version = null,
-  originalCommitHash = null,
-  modBaseBranchHash = null,
-  currentBaseBranchHash = null
-) {
-  return git.generateEnhancedCommitMessage(
-    patchName,
-    version,
-    originalCommitHash,
-    modBaseBranchHash,
-    currentBaseBranchHash
-  );
-}
-
-/**
- * Parses an enhanced commit message to extract metadata
- * @param {string} commitMessage - The commit message to parse
- * @returns {Object} - The parsed metadata
- */
-function parseEnhancedCommitMessage(commitMessage) {
-  return git.parseEnhancedCommitMessage(commitMessage);
-}
-
-/**
- * Get all registered patch repositories
- * @returns {Promise<Array<{name: string, url: string}>>} Array of repository objects
- */
-async function getRegisteredRepositories() {
-  return git.getRegisteredRepositories();
 }
 
 /**
@@ -499,7 +414,7 @@ async function addRepository(nameOrUrl, url) {
 async function removeRepository(name) {
   try {
     // Check if repository is verified
-    const repositories = await getRegisteredRepositories();
+    const repositories = await git.getRegisteredRepositories();
     const repo = repositories.find((r) => r.name === name);
 
     if (!repo) {
@@ -533,7 +448,7 @@ async function removeRepository(name) {
  */
 async function listRepositories() {
   try {
-    const repositories = await getRegisteredRepositories();
+    const repositories = await git.getRegisteredRepositories();
     const verifiedRepos = await fetchVerifiedRepositories();
     const verifiedRepoMap = new Map(verifiedRepos.map((r) => [r.url, r]));
 
@@ -630,7 +545,7 @@ async function ensureValidProject(options = {}) {
       try {
         // spinner.text = "Checking for verified repositories...";
         const verifiedRepos = await fetchVerifiedRepositories();
-        const currentRepos = await getRegisteredRepositories();
+        const currentRepos = await git.getRegisteredRepositories();
         const currentRepoUrls = new Map(
           currentRepos.map((r) => [r.url, r.name])
         );
@@ -782,7 +697,7 @@ async function applyPatchFromRepo(patchName, remoteName) {
 
     // Get current base branch hash
     const baseBranch = await utils.getBaseBranch();
-    const baseRemote = await getBaseRemote();
+    const baseRemote = await git.getBaseRemote();
     const currentBaseBranchHash = await utils.execGit(
       ["rev-parse", `${baseRemote}/${baseBranch}`],
       "Failed to get current base branch commit hash"
@@ -790,7 +705,7 @@ async function applyPatchFromRepo(patchName, remoteName) {
 
     // Try to extract mod base branch hash from the original commit message
     let modBaseBranchHash = null;
-    const parsedMessage = parseEnhancedCommitMessage(commitMessage);
+    const parsedMessage = git.parseEnhancedCommitMessage(commitMessage);
 
     if (
       parsedMessage &&
@@ -855,7 +770,7 @@ async function applyPatchFromRepo(patchName, remoteName) {
       );
 
       // Generate enhanced commit message with metadata
-      const enhancedCommitMessage = await generateEnhancedCommitMessage(
+      const enhancedCommitMessage = await git.generateEnhancedCommitMessage(
         namespacedPatchName,
         version,
         originalCommitHash,
@@ -903,7 +818,7 @@ async function applyPatchFromRepo(patchName, remoteName) {
       await utils.execGit(["add", "."], "Failed to stage changes");
 
       // Generate enhanced commit message with metadata
-      const enhancedCommitMessage = await generateEnhancedCommitMessage(
+      const enhancedCommitMessage = await git.generateEnhancedCommitMessage(
         namespacedPatchName,
         version,
         originalCommitHash,
@@ -943,7 +858,7 @@ async function parsePatchName(fullPatchName) {
   const remoteName = parts[0];
 
   // Verify the remote exists
-  const repositories = await getRegisteredRepositories();
+  const repositories = await git.getRegisteredRepositories();
   const repoExists = repositories.some((repo) => repo.name === remoteName);
 
   if (!repoExists) {
@@ -1146,7 +1061,8 @@ async function listPatches() {
     const baseRemote = await git.getBaseRemote();
 
     // Fetch latest refs and tags
-    await git.execGit(["fetch", "--all", "--tags"], "Failed to fetch refs and tags")
+    await git
+      .execGit(["fetch", "--all", "--tags"], "Failed to fetch refs and tags")
       .catch((e) => {
         // Log but continue if fetch fails
         spinner.warn(`Could not fetch latest refs: ${e.message}`);
@@ -1309,7 +1225,7 @@ async function listPatches() {
             );
 
             if (commitTimestamp) {
-              const relativeTime = getRelativeTime(
+              const relativeTime = utils.getRelativeTime(
                 parseInt(commitTimestamp) * 1000
               );
               console.log(chalk.gray(`    Committed: ${relativeTime}`));
@@ -1355,7 +1271,7 @@ async function listPatches() {
       );
 
       if (commitTimestamp) {
-        const relativeTime = getRelativeTime(parseInt(commitTimestamp) * 1000);
+        const relativeTime = utils.getRelativeTime(parseInt(commitTimestamp) * 1000);
         console.log(`  Last updated: ${relativeTime}`);
       }
 
@@ -1424,7 +1340,7 @@ async function resetPatches() {
       spinner.text = `Branch ${currentBranch} does not exist`;
     }
 
-    // Sync with remote 
+    // Sync with remote
     spinner.text = "Syncing with remote repository...";
     await utils.syncBranches(); // Keep this for now
 
@@ -1437,99 +1353,6 @@ async function resetPatches() {
     spinner.fail(`Reset failed: ${error.message}`);
     throw error;
   }
-}
-
-async function promptForNewProject() {
-  const { projectName } = await inquirer.prompt([
-    {
-      type: "input",
-      name: "projectName",
-      message: "What is your project name?",
-      default: path.basename(process.cwd()),
-      validate: (input) => input.trim().length > 0,
-    },
-  ]);
-  const projectPath = path.join(process.cwd(), projectName);
-
-  // Create project directory
-  await fs.mkdir(projectPath, { recursive: true });
-  process.chdir(projectPath);
-  PROJECT_PATH = projectPath;
-  // Initialize git repo
-  await utils.execGit(["init"], "Failed to initialize git repository");
-  await utils.execGit(
-    ["remote", "add", "origin", TARGET_REPO],
-    "Failed to add origin remote"
-  );
-  return projectPath;
-}
-
-async function promptForBranch() {
-  const currentBranch = await utils.getCurrentBranch();
-  const branches = await utils.execGit(
-    ["branch", "-a"],
-    "Failed to list branches"
-  );
-  const availableBranches = branches
-    .split("\n")
-    .map((b) => b.trim().replace("* ", ""))
-    .filter((b) => !b.startsWith("remotes/"));
-
-  const { branch } = await inquirer.prompt([
-    {
-      type: "list",
-      name: "branch",
-      message: "Which branch would you like to use?",
-      default: currentBranch,
-      choices: availableBranches,
-    },
-  ]);
-
-  return branch;
-}
-
-async function promptForPatches() {
-  const patches = await searchPatches();
-  if (patches.length === 0) {
-    console.log("No patches available to apply.");
-    return [];
-  }
-
-  const patchChoices = await Promise.all(
-    patches.map(async (patch) => {
-      try {
-        const { author, relativeTime } = await getPatchInfo(
-          patch.name,
-          patch.remote
-        );
-        // Always display with repository prefix
-        const displayName = `${patch.remote}/${patch.name}`;
-        return {
-          name: `${displayName} (by ${author}, ${relativeTime})`,
-          value: displayName,
-        };
-      } catch (error) {
-        // Fallback if we can't get patch info
-        const displayName = `${patch.remote}/${patch.name}`;
-        return {
-          name: displayName,
-          value: displayName,
-        };
-      }
-    })
-  );
-
-  const { selectedPatches } = await inquirer.prompt([
-    {
-      type: "checkbox",
-      name: "selectedPatches",
-      message: "Select patches to apply:",
-      choices: patchChoices,
-      pageSize: 10,
-    },
-  ]);
-
-  return selectedPatches;
 }
 
 // Modified function to detect switch-type variables in .env.example
@@ -1565,41 +1388,6 @@ async function findEnvVariables(envFile) {
   }
 
   return variables;
-}
-
-async function promptForEnvVariables(variables) {
-  const values = {};
-  const questions = [];
-
-  for (const variable of variables) {
-    if (variable.type === "input") {
-      questions.push({
-        type: "input",
-        name: variable.key,
-        message: `Enter value for ${variable.key}:`,
-        validate: (input) => {
-          if (input.trim().length === 0) {
-            return `${variable.key} cannot be empty`;
-          }
-          return true;
-        },
-      });
-    } else if (variable.type === "switch") {
-      questions.push({
-        type: "list",
-        name: variable.key,
-        message: `Select value for ${variable.key}:`,
-        choices: variable.options,
-        default: variable.defaultValue,
-      });
-    }
-  }
-
-  if (questions.length > 0) {
-    return await inquirer.prompt(questions);
-  }
-
-  return values;
 }
 
 async function writeEnvFile(envFile, variables) {
@@ -1648,116 +1436,6 @@ async function setupEnvironment(spinner) {
   }
 }
 
-/**
- * Search for patches across all registered repositories
- * @param {string} searchTerm - Optional search term to filter patches
- * @returns {Promise<Array<{name: string, remote: string}>>} Array of patch objects with remote info
- */
-async function searchPatches(searchTerm = "") {
-  // Get all registered repositories
-  const repositories = await getRegisteredRepositories();
-  const verifiedRepos = await fetchVerifiedRepositories();
-  const verifiedRepoMap = new Map(verifiedRepos.map((r) => [r.url, r]));
-
-  const results = [];
-
-  for (const repo of repositories) {
-    try {
-      // Update the remote
-      await utils.execGit(["remote", "update", repo.name, "--prune"]);
-
-      // Get branches from this remote
-      const branches = await utils.execGit(
-        ["branch", "-a"],
-        `Failed to list branches from ${repo.name}`
-      );
-
-      // Filter remote branches that follow the patch pattern (cow_*)
-      // MODIFIED: Updated to exclude our new backup branch format (cow_repoName_patchName_v*)
-      const remoteBranches = branches
-        .split("\n")
-        .map((b) => b.trim())
-        .filter(
-          (b) =>
-            b.startsWith(`remotes/${repo.name}/cow_`) &&
-            !b.includes("backup") &&
-            // Exclude our new backup branch format
-            !b.match(/remotes\/.*\/cow_.*_.*_v\d/)
-        )
-        .map((b) => b.replace(`remotes/${repo.name}/`, ""))
-        .map((b) => b.replace(`cow_`, "")); // Remove package prefix
-
-      // Add to results with remote info
-      remoteBranches.forEach((branch) => {
-        if (!searchTerm || branch.includes(searchTerm)) {
-          const isVerified = verifiedRepoMap.has(repo.url);
-          results.push({
-            name: branch,
-            remote: repo.name,
-            isVerified,
-          });
-        }
-      });
-    } catch (error) {
-      console.warn(
-        `Warning: Failed to search in repository ${repo.name}: ${error.message}`
-      );
-    }
-  }
-
-  return results;
-}
-
-function getRelativeTime(timestamp) {
-  const diff = Date.now() - timestamp;
-  const seconds = Math.floor(diff / 1000);
-  const minutes = Math.floor(seconds / 60);
-  const hours = Math.floor(minutes / 60);
-  const days = Math.floor(hours / 24);
-  const weeks = Math.floor(days / 7);
-  const months = Math.floor(days / 30);
-  const years = Math.floor(days / 365);
-
-  if (years > 0) return `${years}y ago`;
-  if (months > 0) return `${months}mo ago`;
-  if (weeks > 0) return `${weeks}w ago`;
-  if (days > 0) return `${days}d ago`;
-  if (hours > 0) return `${hours}h ago`;
-  if (minutes > 0) return `${minutes}m ago`;
-  return `${seconds}s ago`;
-}
-
-/**
- * Get information about a patch
- * @param {string} branchName - Name of the patch
- * @param {string} remoteName - Name of the remote
- * @returns {Promise<{author: string, relativeTime: string}>} Patch info
- */
-async function getPatchInfo(branchName, remoteName) {
-  const fullBranchName = `${remoteName}/cow_${branchName}`;
-  try {
-    const commitInfo = await utils.execGit(
-      ["log", "-1", "--format=%an|%at", fullBranchName],
-      `Failed to get commit info for ${branchName} from ${remoteName}`
-    );
-
-    const [author, timestamp] = commitInfo.split("|");
-    const relativeTime = getRelativeTime(parseInt(timestamp) * 1000);
-
-    return {
-      author,
-      relativeTime,
-    };
-  } catch (error) {
-    console.warn(
-      `Warning: Could not get info for ${branchName} from ${remoteName}: ${error.message}`
-    );
-    return {
-      author: "Unknown",
-      relativeTime: "Unknown",
-    };
-  }
-}
 
 /**
  * Get all applied patches with enhanced metadata from commit messages
@@ -1993,7 +1671,7 @@ async function syncPatches(options = {}) {
               );
 
               // Get base branch hash for metadata
-              const baseRemote = await getBaseRemote();
+              const baseRemote = await git.getBaseRemote();
               const currentBaseBranchHash = await utils.execGit(
                 ["rev-parse", `${baseRemote}/${baseBranch}`],
                 "Failed to get current base branch commit hash"
@@ -2004,7 +1682,7 @@ async function syncPatches(options = {}) {
               await utils.execGit(["add", "."], "Failed to stage changes");
 
               // Create an enhanced commit message with proper metadata
-              const enhancedCommitMessage = await generateEnhancedCommitMessage(
+              const enhancedCommitMessage = await git.generateEnhancedCommitMessage(
                 patchName,
                 versionToUse,
                 originalCommitHash,
@@ -2347,37 +2025,6 @@ async function popStashedChanges(wasStashed) {
 }
 
 /**
- * Prompt the user for action after updating a dev patch
- * @param {string} patchName - The name of the patch
- * @param {boolean} hasChanges - Whether there were significant changes
- * @returns {Promise<string>} - The selected action
- */
-async function promptForAction(patchName, hasChanges) {
-  const choices = [
-    { name: "Keep changes locally only", value: "keep" },
-    { name: "Create a new release", value: "release" },
-  ];
-
-  if (!hasChanges) {
-    console.log(chalk.blue(`No significant changes detected for ${patchName}`));
-  } else {
-    console.log(chalk.yellow(`Significant changes detected for ${patchName}`));
-  }
-
-  const { action } = await inquirer.prompt([
-    {
-      type: "list",
-      name: "action",
-      message: "What would you like to do with the updated patch?",
-      choices,
-      default: hasChanges ? "release" : "keep",
-    },
-  ]);
-
-  return action;
-}
-
-/**
  * Get the preferred repository for releasing a mod
  * First checks git config, then falls back to interactive selection
  * @param {string} patchName - Name of the patch
@@ -2395,7 +2042,7 @@ async function getPreferredReleaseRepository(patchName) {
 
       if (configuredRepo) {
         // Verify the repository exists
-        const repositories = await getRegisteredRepositories();
+        const repositories = await git.getRegisteredRepositories();
         if (repositories.some((repo) => repo.name === configuredRepo.trim())) {
           return configuredRepo.trim();
         }
@@ -2405,7 +2052,7 @@ async function getPreferredReleaseRepository(patchName) {
     }
 
     // Fall back to interactive selection
-    const repositories = await getRegisteredRepositories();
+    const repositories = await git.getRegisteredRepositories();
 
     if (repositories.length === 1) {
       // If only one repository is available, use it
@@ -2479,7 +2126,7 @@ async function updateBranch(branchName, options = {}) {
     spinner.text = `Updating branch ${branchName} for patch ${patchName}...`;
 
     const baseBranch = await utils.getBaseBranch();
-    const baseRemote = await getBaseRemote();
+    const baseRemote = await git.getBaseRemote();
     const currentBranch = await utils.getCurrentBranch();
 
     // Verify we're on the target branch
@@ -2678,7 +2325,7 @@ async function releaseBranch(sourceBranch, patchName = null, options = {}) {
 
     // Get base branch to use as clean slate
     const baseBranch = await utils.getBaseBranch();
-    const baseRemote = await getBaseRemote();
+    const baseRemote = await git.getBaseRemote();
 
     // Check if release branch exists and create backup if needed
     const branches = (
@@ -2984,7 +2631,9 @@ program
       spinner.text = `Updating ${sourceBranch} with latest base branch changes...`;
       try {
         await updateBranch(sourceBranch, { ...options, nonInteractive: true });
-        spinner.succeed(`Updated ${sourceBranch} with latest base branch changes`);
+        spinner.succeed(
+          `Updated ${sourceBranch} with latest base branch changes`
+        );
         spinner.start(`Proceeding with release...`);
       } catch (updateError) {
         spinner.fail(`Failed to update branch: ${updateError.message}`);
@@ -3011,7 +2660,7 @@ program
       let targetRepo;
       if (options.repository) {
         // Verify the specified repository exists
-        const repositories = await getRegisteredRepositories();
+        const repositories = await git.getRegisteredRepositories();
         if (!repositories.some((repo) => repo.name === options.repository)) {
           spinner.fail(`Repository '${options.repository}' not found`);
           throw new Error(
@@ -3083,7 +2732,7 @@ program
       }
 
       // Get base branch for clean slate
-      const baseRemote = await getBaseRemote();
+      const baseRemote = await git.getBaseRemote();
 
       // Create/reset release branch from base
       if (branches.includes(releaseBranch)) {
@@ -3434,7 +3083,7 @@ program
       }
 
       // Get repository information for verification badges
-      const repositories = await getRegisteredRepositories();
+      const repositories = await git.getRegisteredRepositories();
       const verifiedRepos = await fetchVerifiedRepositories();
       const verifiedRepoMap = new Map(verifiedRepos.map((r) => [r.url, r]));
 
@@ -3448,7 +3097,9 @@ program
             );
 
             // Use tag-compatible name for tag list
-            const tagCompatibleName = git.getTagCompatibleName(`${repo}/${patch}`);
+            const tagCompatibleName = git.getTagCompatibleName(
+              `${repo}/${patch}`
+            );
 
             // Get tag list using the tag-compatible name
             const tagsOutput = await utils.execGit(
