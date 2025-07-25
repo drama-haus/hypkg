@@ -71,17 +71,47 @@ async function promptForBranch() {
     ["branch", "-a"],
     "Failed to list branches"
   );
-  const availableBranches = branches
+  
+  // Get both local and remote branches
+  const allBranches = branches
     .split("\n")
     .map((b) => b.trim().replace("* ", ""))
-    .filter((b) => !b.startsWith("remotes/"));
+    .filter((b) => b && !b.includes("HEAD"));
+
+  // Extract unique branch names (local and remote)
+  const branchNames = new Set();
+  
+  // Add local branches
+  allBranches
+    .filter((b) => !b.startsWith("remotes/"))
+    .forEach((b) => branchNames.add(b));
+  
+  // Add remote branches (extract just the branch name)
+  allBranches
+    .filter((b) => b.startsWith("remotes/origin/"))
+    .forEach((b) => {
+      const branchName = b.replace("remotes/origin/", "");
+      branchNames.add(branchName);
+    });
+
+  const availableBranches = Array.from(branchNames).sort();
+
+  // Determine default branch preference: dev > main > master > current > first available
+  let defaultBranch = currentBranch;
+  if (availableBranches.includes('dev')) {
+    defaultBranch = 'dev';
+  } else if (availableBranches.includes('main')) {
+    defaultBranch = 'main';
+  } else if (availableBranches.includes('master')) {
+    defaultBranch = 'master';
+  }
 
   const { branch } = await inquirer.prompt([
     {
       type: "list",
       name: "branch",
       message: "Which branch would you like to use?",
-      default: currentBranch,
+      default: defaultBranch,
       choices: availableBranches,
     },
   ]);

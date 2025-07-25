@@ -52,12 +52,11 @@ const {
 const {
   browseForks,
   addGitHubRepository,
-  enhanceRepositoriesWithGitHubData
+  enhanceRepositoriesWithGitHubData,
+  setupCustomRepositories
 } = require("./github");
 
 const config = {
-  patchesRepo: packageJson.config.patchesRepo,
-  patchesRemote: packageJson.config.patchesRemoteName,
   targetRepo: packageJson.config.targetRepo,
   packageName: packageJson.name,
 };
@@ -298,29 +297,8 @@ async function ensureValidProject(options = {}) {
         }
       }
 
-      try {
-        // spinner.text = "Checking for verified repositories...";
-        const verifiedRepos = await fetchVerifiedRepositories();
-        const currentRepos = await git.getRegisteredRepositories();
-        const currentRepoUrls = new Map(
-          currentRepos.map((r) => [r.url, r.name])
-        );
-
-        for (const verifiedRepo of verifiedRepos) {
-          if (!currentRepoUrls.has(verifiedRepo.url)) {
-            // spinner.text = `Adding verified repository: ${verifiedRepo.name}`;
-            await addRepository(
-              verifiedRepo.name.replace(".", "-"),
-              verifiedRepo.url
-            );
-            // spinner.succeed(`Added verified repository: ${verifiedRepo.name}`);
-          }
-        }
-      } catch (error) {
-        // spinner.warn(
-        //   `Warning: Could not ensure verified repositories: ${error.message}`
-        // );
-      }
+      // Note: Automatic repository addition has been removed.
+      // Users now manage repositories manually via CLI commands or interactive setup.
     } catch (error) {
       log(`Failed to read package.json: ${error.message}`, "error");
       return false;
@@ -438,6 +416,64 @@ async function parsePatchName(fullPatchName) {
  */
 function isNamespacedPatch(patchName) {
   return patchName.includes("/");
+}
+
+/**
+ * Detect existing setup and migrate if needed
+ * @returns {Promise<string>} - Migration status: 'new', 'migrated', or 'existing'
+ */
+async function detectExistingSetup() {
+  try {
+    // Check if user already has drama-haus remote
+    const remotes = await utils.execGit(["remote"], "Failed to list remotes");
+    const remoteList = remotes
+      .split("\n")
+      .map((r) => r.trim())
+      .filter(Boolean);
+
+    const hasDramaHaus = remoteList.includes('drama-haus');
+    
+    if (hasDramaHaus) {
+      // Check if drama-haus points to the expected URL
+      try {
+        const dramaHausUrl = await utils.execGit(
+          ["remote", "get-url", "drama-haus"],
+          "Failed to get drama-haus URL"
+        );
+        
+        if (dramaHausUrl.trim().includes('drama-haus/hyperfy')) {
+          // We have existing drama-haus remote, convert it to registered repository
+          // Check if it's already registered
+          const repositories = await git.getRegisteredRepositories();
+          const alreadyRegistered = repositories.some(repo => 
+            repo.name === 'drama-haus' && repo.url.includes('drama-haus/hyperfy')
+          );
+          
+          if (!alreadyRegistered) {
+            // Convert the remote to a registered repository
+            log('Migrating existing drama-haus remote to new repository system...', 'info');
+            return 'migrated';
+          } else {
+            return 'existing';
+          }
+        }
+      } catch (error) {
+        // Remote exists but we can't get URL, treat as new setup
+        return 'new';
+      }
+    }
+    
+    // Check if we already have any repositories configured
+    const repositories = await git.getRegisteredRepositories();
+    if (repositories.length > 0) {
+      return 'existing';
+    }
+    
+    return 'new';
+  } catch (error) {
+    console.warn(`Failed to detect existing setup: ${error.message}`);
+    return 'new';
+  }
 }
 
 async function removePatch(patchName) {
@@ -1398,16 +1434,61 @@ async function interactiveInstall(options = {}) {
     );
     spinner.succeed("Branch checked out");
 
-    await utils.setupPatchesRemote(config.patchesRepo, config.patchesRemote);
-
     // Setup patch management with selected branch
     spinner.start("Setting up mod management...");
     await utils.ensurePatchBranch(
       BRANCH_NAME,
-      selectedBranch,
-      config.patchesRemote
+      selectedBranch
     );
     spinner.succeed("Patch management configured");
+
+    // Stop spinner for repository setup choice
+    spinner.stop();
+    
+    // Check for existing drama-haus setup and migration
+    const migrationStatus = await detectExistingSetup();
+    
+    if (migrationStatus === 'migrated') {
+      spinner.start('Migrated existing drama-haus setup');
+      // Skip repository setup prompt since we already have repositories
+    } else {
+      // Repository setup choice prompt
+      const { setupChoice } = await inquirer.prompt([{
+        type: 'list',
+        name: 'setupChoice',
+        message: 'Choose your mod repository setup:',
+        choices: [
+          { 
+            name: 'Default - Install drama-haus (recommended)', 
+            value: 'default',
+            short: 'Default'
+          },
+          { 
+            name: 'Custom - Select repositories from GitHub', 
+            value: 'custom',
+            short: 'Custom'
+          }
+        ]
+      }]);
+
+      if (setupChoice === 'default') {
+        // Add drama-haus repository directly
+        spinner.start('Adding drama-haus repository...');
+        try {
+          const result = await addRepository('drama-haus', 'https://github.com/drama-haus/hyperfy');
+          if (result.success) {
+            spinner.succeed('drama-haus repository added');
+          } else {
+            spinner.warn(`Failed to add drama-haus: ${result.error}`);
+          }
+        } catch (error) {
+          spinner.warn(`Failed to add drama-haus: ${error.message}`);
+        }
+      } else {
+        // Launch filtered GitHub fork browser
+        await setupCustomRepositories();
+      }
+    }
 
     // Stop spinner for mod selection
     spinner.stop();
@@ -2685,6 +2766,8 @@ githubCommand
   .command("browse-forks [repository]")
   .description("Browse forks of a repository (format: owner/repo, defaults to origin if in git repo)")
   .option("-l, --list", "List forks without interactive selection")
+  .option("--all", "Show all forks, not just those with mod branches")
+  .option("-r, --refresh", "Refresh cache and fetch latest data")
   .action(async (repository, options) => {
     try {
       await browseForks(repository, options);

@@ -1,5 +1,6 @@
 const https = require('https');
 const { URL } = require('url');
+const { Cache } = require('./cache');
 
 class GitHubAPI {
   constructor() {
@@ -7,6 +8,7 @@ class GitHubAPI {
     this.rateLimitRemaining = 60;
     this.rateLimitReset = null;
     this.userAgent = 'hypkg-mod-manager/1.0';
+    this.cache = new Cache();
   }
 
   /**
@@ -130,10 +132,20 @@ class GitHubAPI {
    * Get forks of a repository
    * @param {string} owner - Repository owner
    * @param {string} repo - Repository name
-   * @param {object} options - Options
+   * @param {object} options - Options (refresh, filterByModBranches, etc.)
    * @returns {Promise<Array>} - Array of fork objects
    */
   async getForks(owner, repo, options = {}) {
+    const cacheKey = `forks-${owner}-${repo}`;
+    
+    // Check cache unless refresh is requested
+    if (!options.refresh) {
+      const cached = await this.cache.getRepositories();
+      if (cached && cached[cacheKey]) {
+        return cached[cacheKey];
+      }
+    }
+
     const params = {
       sort: options.sort || 'newest',
       per_page: options.perPage || 50,
@@ -142,6 +154,37 @@ class GitHubAPI {
 
     try {
       const forks = await this.request(`/repos/${owner}/${repo}/forks`, { params });
+      
+      // Filter by mod branches by default (unless explicitly disabled)
+      if (options.filterByModBranches !== false) {
+        const validForks = [];
+        
+        for (const fork of forks) {
+          const branchInfo = await this.hasValidModBranches(fork.owner.login, fork.name);
+          
+          if (branchInfo.hasModBranches) {
+            // Attach mod branch information to the fork object
+            fork._modBranches = branchInfo;
+            validForks.push(fork);
+          }
+          
+          // Rate limiting delay to be respectful to GitHub API
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        
+        // Cache the filtered results
+        const cached = await this.cache.getRepositories() || {};
+        cached[cacheKey] = validForks;
+        await this.cache.saveRepositories(cached);
+        
+        return validForks;
+      }
+      
+      // Cache unfiltered results
+      const cached = await this.cache.getRepositories() || {};
+      cached[cacheKey] = forks || [];
+      await this.cache.saveRepositories(cached);
+      
       return forks || [];
     } catch (error) {
       if (error.status === 404) {
@@ -169,6 +212,80 @@ class GitHubAPI {
     } catch (error) {
       // If we can't get branches, return 0 to avoid breaking the display
       return 0;
+    }
+  }
+
+  /**
+   * Check if repository has valid mod branches (cow_ prefix)
+   * Filters out versioned duplicates (e.g., cow_mod-name_v1.0.0)
+   * @param {string} owner - Repository owner
+   * @param {string} repo - Repository name
+   * @returns {Promise<{hasModBranches: boolean, modBranchCount: number, modBranches: string[], uniqueMods: string[]}>}
+   */
+  async hasValidModBranches(owner, repo) {
+    try {
+      const branches = await this.request(`/repos/${owner}/${repo}/branches`, { 
+        params: { per_page: 100 } 
+      });
+      
+      const modBranches = branches.filter(branch => 
+        branch.name.startsWith('cow_')
+      );
+      
+      // Extract unique mod names (remove version suffixes)
+      const uniqueMods = new Set();
+      const allModBranches = modBranches.map(b => b.name);
+      
+      for (const branch of allModBranches) {
+        // Remove cow_ prefix
+        let modName = branch.replace('cow_', '');
+        
+        // Remove various version suffix patterns
+        // Standard semantic versioning: _v1.0.0, _version_1.0.0, etc.
+        modName = modName.replace(/_v\d+\.\d+\.\d+[\w\-\.]*$/, '');
+        modName = modName.replace(/_version_\d+\.\d+\.\d+[\w\-\.]*$/, '');
+        modName = modName.replace(/_\d+\.\d+\.\d+[\w\-\.]*$/, '');
+        
+        // Alternative version patterns: _v1.0, _v1, etc.
+        modName = modName.replace(/_v\d+\.\d+[\w\-\.]*$/, '');
+        modName = modName.replace(/_v\d+[\w\-\.]*$/, '');
+        
+        // Date-based versions: _20231201, _2023-12-01, etc.
+        modName = modName.replace(/_\d{8}$/, '');
+        modName = modName.replace(/_\d{4}-\d{2}-\d{2}$/, '');
+        
+        // Backup/repo branch patterns: _repo_name_v1.0.0, _backup_v1.0.0
+        modName = modName.replace(/_[^_]+_v\d+\.\d+\.\d+[\w\-\.]*$/, '');
+        modName = modName.replace(/_backup_.*$/, '');
+        modName = modName.replace(/_old_.*$/, '');
+        
+        // Hash suffixes: _abc123def, _git_hash
+        modName = modName.replace(/_[a-f0-9]{6,}$/, '');
+        
+        // Final cleanup: remove trailing underscores and ensure valid mod name
+        modName = modName.replace(/_+$/, '');
+        
+        if (modName && modName.length > 0 && !modName.startsWith('_')) {
+          uniqueMods.add(modName);
+        }
+      }
+      
+      const uniqueModArray = Array.from(uniqueMods);
+      
+      return {
+        hasModBranches: uniqueModArray.length > 0,
+        modBranchCount: uniqueModArray.length, // Count unique mods, not total branches
+        modBranches: allModBranches,
+        uniqueMods: uniqueModArray
+      };
+    } catch (error) {
+      // If we can't get branches, return no mods found
+      return { 
+        hasModBranches: false, 
+        modBranchCount: 0, 
+        modBranches: [],
+        uniqueMods: []
+      };
     }
   }
 
@@ -263,6 +380,30 @@ class GitHubAPI {
     if (diffInSeconds < 2592000) return `${Math.floor(diffInSeconds / 86400)} days ago`;
     if (diffInSeconds < 31536000) return `${Math.floor(diffInSeconds / 2592000)} months ago`;
     return `${Math.floor(diffInSeconds / 31536000)} years ago`;
+  }
+
+  /**
+   * Get cache status information
+   * @returns {Promise<object>} - Cache status info
+   */
+  async getCacheStatus() {
+    const cacheAge = await this.cache.getCacheAge();
+    const hasCache = cacheAge >= 0;
+    
+    return {
+      hasCache,
+      ageMinutes: cacheAge,
+      ageFormatted: hasCache ? `${Math.floor(cacheAge / 60)}h ${cacheAge % 60}m ago` : 'No cache',
+      isExpired: hasCache && cacheAge > (24 * 60) // 24 hours in minutes
+    };
+  }
+
+  /**
+   * Clear all cached data
+   * @returns {Promise<void>}
+   */
+  async clearCache() {
+    await this.cache.clearCache();
   }
 }
 

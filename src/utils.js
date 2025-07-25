@@ -57,8 +57,7 @@ module.exports = {
   restoreGitState: git.restoreGitState,
 
   // Repository management
-  verifyRepo: git.verifyRepo, 
-  setupPatchesRemote: git.setupPatchesRemote,
+  verifyRepo: git.verifyRepo,
 
   // Branch management
   syncBranches: git.syncBranches,

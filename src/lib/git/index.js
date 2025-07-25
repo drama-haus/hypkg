@@ -53,7 +53,6 @@ module.exports = {
   removeRemote: remote.removeRemote,
   fetchRemote: remote.fetchRemote,
   getBaseRemote: remote.getBaseRemote,
-  setupPatchesRemote: remote.setupPatchesRemote,
   verifyRepo: remote.verifyRepo,
   
   // Patch operations

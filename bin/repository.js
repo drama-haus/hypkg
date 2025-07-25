@@ -43,8 +43,6 @@ const { getAppliedPatches } = require("./getAppliedPatches");
 
 
 const config = {
-  patchesRepo: packageJson.config.patchesRepo,
-  patchesRemote: packageJson.config.patchesRemoteName,
   targetRepo: packageJson.config.targetRepo,
   packageName: packageJson.name,
 };

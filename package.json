@@ -19,8 +19,6 @@
     "inquirer": "^8.2.6"
   },
   "config": {
-    "patchesRepo": "https://github.com/drama-haus/hyperfy",
-    "patchesRemoteName": "drama-haus",
     "targetRepo": "https://github.com/hyperfy-xyz/hyperfy"
   },
   "devDependencies": {

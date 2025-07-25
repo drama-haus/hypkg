@@ -151,21 +151,6 @@ async function getBaseRemote(canonicalRepo = null) {
   return GIT.REMOTES.ORIGIN;
 }
 
-/**
- * Set up a patches remote
- * @param {string} patchesRepo - URL of the patches repository
- * @param {string} patchesRemote - Name for the patches remote
- * @returns {Promise<void>}
- */
-async function setupPatchesRemote(patchesRepo, patchesRemote) {
-  const remotes = await getRemotes();
-  
-  if (!remotes.includes(patchesRemote)) {
-    await addRemote(patchesRemote, patchesRepo);
-  }
-  
-  return fetchRemote(patchesRemote);
-}
 
 /**
  * Verify that the current repository matches the expected repository
@@ -193,6 +178,5 @@ module.exports = {
   removeRemote,
   fetchRemote,
   getBaseRemote,
-  setupPatchesRemote,
   verifyRepo
 }; 

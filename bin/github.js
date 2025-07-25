@@ -30,7 +30,7 @@ async function getOriginRepository() {
 /**
  * Browse forks of a repository
  * @param {string} repositoryPath - Repository in format "owner/repo" (optional if in git repo)
- * @param {object} options - Command options
+ * @param {object} options - Command options (all, list, refresh)
  */
 async function browseForks(repositoryPath, options = {}) {
   const spinner = ora('Fetching repository forks...').start();
@@ -59,39 +59,70 @@ async function browseForks(repositoryPath, options = {}) {
     const mainRepo = await github.getRepository(owner, repo);
     const formattedMain = github.formatRepository(mainRepo);
 
-    // Get forks
-    spinner.text = 'Fetching forks...';
-    const forks = await github.getForks(owner, repo, { perPage: 100 });
+    // Get forks with filtering enabled by default (unless --all flag is used)
+    if (options.refresh) {
+      spinner.text = 'Refreshing repository data...';
+    } else if (options.all) {
+      spinner.text = 'Fetching all forks...';
+    } else {
+      spinner.text = 'Fetching forks with mod branches...';
+    }
+    
+    const forks = await github.getForks(owner, repo, { 
+      perPage: 100,
+      filterByModBranches: !options.all,  // Filter unless --all flag is used
+      refresh: options.refresh  // Pass refresh option to bypass cache
+    });
     
     if (forks.length === 0) {
-      spinner.info(`No forks found for ${repositoryPath}`);
+      if (options.all) {
+        spinner.info(`No forks found for ${repositoryPath}`);
+      } else {
+        spinner.info(`No forks found with mod branches (cow_* prefixed branches) for ${repositoryPath}`);
+        console.log('💡 Use --all flag to see all forks, including those without mod branches');
+      }
       return;
     }
-
-    spinner.succeed(`Found ${forks.length} forks of ${repositoryPath}`);
-
-    // Format forks for display and get branch counts
-    spinner.text = 'Getting branch counts for forks...';
-    const formattedForks = await Promise.all(forks.map(async fork => {
-      const formatted = github.formatRepository(fork);
-      
-      // Get branch count for this fork
-      let branchCount = 0;
-      try {
-        branchCount = await github.getBranchCount(formatted.owner, formatted.name);
-        // Add small delay to be respectful to API
-        await new Promise(resolve => setTimeout(resolve, 50));
-      } catch (error) {
-        // If we can't get branch count, just use 0
-        branchCount = 0;
+    
+    // Show cache status if not refreshing
+    if (!options.refresh) {
+      const cacheStatus = await github.getCacheStatus();
+      if (cacheStatus.hasCache) {
+        if (options.all) {
+          spinner.succeed(`Found ${forks.length} forks (cached ${cacheStatus.ageFormatted})`);
+        } else {
+          spinner.succeed(`Found ${forks.length} forks with mod branches (cached ${cacheStatus.ageFormatted})`);
+        }
+        if (cacheStatus.isExpired) {
+          console.log('💡 Cache is older than 24 hours. Use --refresh to get latest data');
+        }
+      } else {
+        if (options.all) {
+          spinner.succeed(`Found ${forks.length} forks`);
+        } else {
+          spinner.succeed(`Found ${forks.length} forks with mod branches`);
+        }
       }
+    } else {
+      if (options.all) {
+        spinner.succeed(`Found ${forks.length} forks (refreshed)`);
+      } else {
+        spinner.succeed(`Found ${forks.length} forks with mod branches (refreshed)`);
+      }
+    }
+
+    // Format forks for display
+    const formattedForks = forks.map(fork => {
+      const formatted = github.formatRepository(fork);
       
       return {
         ...formatted,
         lastUpdated: github.formatRelativeTime(formatted.updatedAt),
-        branchCount
+        // Use mod branch count if available (filtered), otherwise total branch count
+        modBranchCount: fork._modBranches ? fork._modBranches.modBranchCount : 0,
+        totalBranchCount: fork._modBranches ? fork._modBranches.modBranchCount : 0 // For --all mode, we'd need to get this separately
       };
-    }));
+    });
 
     // Sort by stars descending, then by last updated
     formattedForks.sort((a, b) => {
@@ -111,7 +142,13 @@ async function browseForks(repositoryPath, options = {}) {
       formattedForks.forEach((fork, index) => {
         console.log(`  ${index + 1}. ${fork.fullName}`);
         console.log(`     ${fork.description}`);
-        console.log(`     ⭐ ${fork.stars} stars, 🌿 ${fork.branchCount} branches, updated ${fork.lastUpdated}`);
+        if (options.all) {
+          // In --all mode, show total branches and mod count
+          console.log(`     ⭐ ${fork.stars} stars, 🚀 ${fork.modBranchCount} mods, updated ${fork.lastUpdated}`);
+        } else {
+          // In filtered mode, show mod count only
+          console.log(`     ⭐ ${fork.stars} stars, 🚀 ${fork.modBranchCount} mods, updated ${fork.lastUpdated}`);
+        }
         if (fork.language) console.log(`     Language: ${fork.language}`);
         console.log();
       });
@@ -120,7 +157,7 @@ async function browseForks(repositoryPath, options = {}) {
 
     // Interactive selection
     const choices = formattedForks.map(fork => ({
-      name: `${fork.fullName} (⭐${fork.stars}, 🌿${fork.branchCount} branches, updated ${fork.lastUpdated})`,
+      name: `${fork.fullName} (⭐${fork.stars}, 🚀${fork.modBranchCount} mods, updated ${fork.lastUpdated})`,
       short: fork.fullName,
       value: fork
     }));
@@ -329,8 +366,102 @@ async function enhanceRepositoriesWithGitHubData(repositories) {
   }
 }
 
+/**
+ * Setup custom repositories by browsing GitHub forks
+ * @param {object} options - Options (refresh)
+ * @returns {Promise<void>}
+ */
+async function setupCustomRepositories(options = {}) {
+  const spinner = ora('Fetching available repositories...').start();
+  
+  try {
+    // Get filtered forks (only those with cow_ branches)
+    const availableForks = await github.getForks('hyperfy-xyz', 'hyperfy', {
+      filterByModBranches: true,
+      perPage: 100,
+      refresh: options.refresh
+    });
+    
+    if (availableForks.length === 0) {
+      spinner.info('No forks found with available mods.');
+      console.log('You can add repositories manually later with: hypkg repository add');
+      return;
+    }
+    
+    spinner.succeed(`Found ${availableForks.length} repositories with mods`);
+    
+    // Format forks for display
+    const formattedForks = availableForks.map(fork => {
+      const formatted = github.formatRepository(fork);
+      return {
+        ...formatted,
+        lastUpdated: github.formatRelativeTime(formatted.updatedAt),
+        modBranchCount: fork._modBranches.modBranchCount,
+        modBranches: fork._modBranches.modBranches
+      };
+    });
+    
+    // Sort by mod count (descending), then by stars
+    formattedForks.sort((a, b) => {
+      if (b.modBranchCount !== a.modBranchCount) return b.modBranchCount - a.modBranchCount;
+      return b.stars - a.stars;
+    });
+    
+    // Multi-select interface
+    const choices = formattedForks.map(fork => ({
+      name: `${fork.fullName} (⭐${fork.stars}, 🚀${fork.modBranchCount} mods, updated ${fork.lastUpdated})`,
+      short: fork.fullName,
+      value: fork
+    }));
+    
+    const { selectedRepos } = await inquirer.prompt([{
+      type: 'checkbox',
+      name: 'selectedRepos',
+      message: 'Select repositories to add:',
+      choices,
+      pageSize: 15,
+      validate: (selection) => {
+        if (selection.length === 0) {
+          return 'Please select at least one repository';
+        }
+        return true;
+      }
+    }]);
+    
+    // Add all selected repositories
+    const addSpinner = ora('Adding selected repositories...').start();
+    const results = [];
+    
+    for (const repo of selectedRepos) {
+      try {
+        await addForkAsRepository(repo);
+        results.push({ repo: repo.fullName, success: true });
+        addSpinner.text = `Added ${repo.fullName}...`;
+      } catch (error) {
+        results.push({ repo: repo.fullName, success: false, error: error.message });
+      }
+    }
+    
+    // Show summary
+    const successful = results.filter(r => r.success);
+    const failed = results.filter(r => !r.success);
+    
+    addSpinner.succeed(`Added ${successful.length} repositories`);
+    
+    if (failed.length > 0) {
+      console.warn(`Failed to add ${failed.length} repositories:`);
+      failed.forEach(f => console.warn(`  - ${f.repo}: ${f.error}`));
+    }
+    
+  } catch (error) {
+    spinner.fail(`Failed to setup repositories: ${error.message}`);
+    throw error;
+  }
+}
+
 module.exports = {
   browseForks,
   addGitHubRepository,
-  enhanceRepositoriesWithGitHubData
+  enhanceRepositoriesWithGitHubData,
+  setupCustomRepositories
 };

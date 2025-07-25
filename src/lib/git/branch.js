@@ -3,6 +3,7 @@
  */
 const { execGit } = require('./commands');
 const { GIT } = require('../constants');
+const { getBaseRemote } = require('./remote');
 
 /**
  * Get the current branch name
@@ -176,10 +177,9 @@ async function syncBranches(remote = 'origin') {
  * Ensure a patch branch exists and is properly set up
  * @param {string} branchName - Name of the branch to ensure
  * @param {string} [selectedBranch] - Remote branch to track (if provided)
- * @param {string} [patchesRemote='patches'] - Remote name for patches
  * @returns {Promise<void>}
  */
-async function ensurePatchBranch(branchName, selectedBranch, patchesRemote = 'patches') {
+async function ensurePatchBranch(branchName, selectedBranch) {
   const exists = await branchExists(branchName);
 
   if (!exists) {
@@ -191,8 +191,10 @@ async function ensurePatchBranch(branchName, selectedBranch, patchesRemote = 'pa
 
   if (selectedBranch) {
     try {
+      // Try to set upstream to origin/selectedBranch by default
+      const baseRemote = await getBaseRemote();
       await execGit(
-        ['branch', `--set-upstream-to=${patchesRemote}/${selectedBranch}`],
+        ['branch', `--set-upstream-to=${baseRemote}/${selectedBranch}`],
         'Failed to set upstream'
       );
     } catch (e) {
