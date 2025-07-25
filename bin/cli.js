@@ -49,6 +49,11 @@ const {
   getRepositoryForPatch,
   getPreferredReleaseRepository
 } = require("./repository");
+const {
+  browseForks,
+  addGitHubRepository,
+  enhanceRepositoriesWithGitHubData
+} = require("./github");
 
 const config = {
   patchesRepo: packageJson.config.patchesRepo,
@@ -2617,7 +2622,7 @@ program.action((options, command) => {
 });
 
 // List of commands that don't require project validation
-const commandsWithoutValidation = ["install", "extract", "bundle"];
+const commandsWithoutValidation = ["install", "extract", "bundle", "github"];
 
 // Add repository management commands
 const repoCommand = new Command("repository").description(
@@ -2659,9 +2664,10 @@ repoCommand
 repoCommand
   .command("list")
   .description("List all registered mod repositories")
-  .action(async () => {
+  .option("--github-info", "Show GitHub metadata (stars, forks, etc.)")
+  .action(async (options) => {
     try {
-      await listRepositories();
+      await listRepositories(options);
     } catch (e) {
       console.error(`Failed to list repositories: ${e.message}`);
       process.exit(1);
@@ -2670,10 +2676,47 @@ repoCommand
 
 program.addCommand(repoCommand);
 
-// Update commandGroups to include repository management
+// Add GitHub integration commands
+const githubCommand = new Command("github").description(
+  "GitHub integration commands"
+);
+
+githubCommand
+  .command("browse-forks [repository]")
+  .description("Browse forks of a repository (format: owner/repo, defaults to origin if in git repo)")
+  .option("-l, --list", "List forks without interactive selection")
+  .action(async (repository, options) => {
+    try {
+      await browseForks(repository, options);
+    } catch (e) {
+      console.error(`Failed to browse forks: ${e.message}`);
+      process.exit(1);
+    }
+  });
+
+githubCommand
+  .command("add <repository>")
+  .description("Add a GitHub repository (format: owner/repo)")
+  .action(async (repository) => {
+    try {
+      await addGitHubRepository(repository);
+    } catch (e) {
+      console.error(`Failed to add repository: ${e.message}`);
+      process.exit(1);
+    }
+  });
+
+program.addCommand(githubCommand);
+
+// Update commandGroups to include repository management and GitHub
 commandGroups.repo = {
   description: "Repository Management:",
   commands: ["repository add", "repository remove", "repository list"],
+};
+
+commandGroups.github = {
+  description: "GitHub Integration:",
+  commands: ["github browse-forks", "github add"],
 };
 
 // Add a pre-action hook to validate the project before any command

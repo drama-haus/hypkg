@@ -223,22 +223,45 @@ async function removeRepository(name) {
 
 /**
  * List all registered patch repositories
+ * @param {object} options - Display options
  */
-async function listRepositories() {
+async function listRepositories(options = {}) {
   try {
     const repositories = await git.getRegisteredRepositories();
     const verifiedRepos = await fetchVerifiedRepositories();
     const verifiedRepoMap = new Map(verifiedRepos.map((r) => [r.url, r]));
 
+    // Enhanced repositories with GitHub data if requested
+    let enhancedRepos = repositories;
+    if (options.githubInfo) {
+      try {
+        const { enhanceRepositoriesWithGitHubData } = require("./github");
+        enhancedRepos = await enhanceRepositoriesWithGitHubData(repositories);
+      } catch (error) {
+        console.warn(`Failed to fetch GitHub data: ${error.message}`);
+      }
+    }
+
     console.log("\nRegistered repositories:");
-    if (repositories.length === 0) {
+    if (enhancedRepos.length === 0) {
       console.log("  No repositories registered");
     } else {
-      repositories.forEach((repo) => {
+      enhancedRepos.forEach((repo) => {
         const verifiedInfo = verifiedRepoMap.has(repo.url)
           ? chalk.green(` [✓ Verified]`)
           : "";
+        
         console.log(`  - ${repo.name}: ${repo.url}${verifiedInfo}`);
+        
+        // Show GitHub metadata if available
+        if (repo.github) {
+          console.log(`    ${repo.github.description}`);
+          console.log(`    ⭐ ${repo.github.stars} stars, 🍴 ${repo.github.forks} forks`);
+          console.log(`    Language: ${repo.github.language}, updated ${repo.github.lastUpdated}`);
+          if (repo.github.topics.length > 0) {
+            console.log(`    Topics: ${repo.github.topics.join(', ')}`);
+          }
+        }
       });
     }
   } catch (error) {
