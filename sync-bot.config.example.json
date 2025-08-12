@@ -1,0 +1,28 @@
+{
+  "canonicalRepo": "organization/main-repo",
+  "targetRepositories": [
+    "user1/forked-repo",
+    "user2/forked-repo"
+  ],
+  "workDir": "./sync-work",
+  "mode": "polling",
+  "pollInterval": 300,
+  "logFile": "sync-bot.log",
+  "webhook": {
+    "port": 3000,
+    "secret": "your-webhook-secret-here"
+  },
+  "discord": {
+    "webhookUrl": "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN",
+    "enabled": true,
+    "mentions": {
+      "onSuccess": [],
+      "onError": ["@here"]
+    },
+    "colors": {
+      "success": 5763719,
+      "error": 15548997,
+      "info": 3447003
+    }
+  }
+}
